@@ -313,6 +313,15 @@ pub struct SandboxArgs {
     pub dry_run: bool,
 }
 
+impl SandboxArgs {
+    /// Whether any CLI flag requires proxy mode activation.
+    pub fn has_proxy_flags(&self) -> bool {
+        self.network_profile.is_some()
+            || !self.proxy_allow.is_empty()
+            || !self.proxy_credential.is_empty()
+    }
+}
+
 #[derive(Parser, Debug)]
 pub struct RunArgs {
     #[command(flatten)]

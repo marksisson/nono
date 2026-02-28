@@ -145,7 +145,7 @@ impl CapabilitySetExt for CapabilitySet {
         // Network blocking or proxy mode
         if args.net_block {
             caps.set_network_blocked(true);
-        } else if args.network_profile.is_some() || !args.proxy_allow.is_empty() {
+        } else if args.has_proxy_flags() {
             // Proxy mode: port 0 is a placeholder, updated when proxy starts.
             // bind_ports are passed through allow_bind CLI flag.
             caps = caps.set_network_mode(nono::NetworkMode::ProxyOnly {
@@ -273,9 +273,7 @@ impl CapabilitySetExt for CapabilitySet {
         // Network blocking or proxy mode from profile
         if profile.network.block {
             caps.set_network_blocked(true);
-        } else if profile.network.network_profile.is_some()
-            || !profile.network.proxy_allow.is_empty()
-        {
+        } else if profile.network.has_proxy_flags() {
             // Profile requests proxy mode; port 0 is a placeholder.
             // bind_ports come from CLI args (--allow-bind).
             caps = caps.set_network_mode(nono::NetworkMode::ProxyOnly {
@@ -363,7 +361,7 @@ fn add_cli_overrides(caps: &mut CapabilitySet, args: &SandboxArgs) -> Result<()>
     // CLI network blocking overrides profile
     if args.net_block {
         caps.set_network_blocked(true);
-    } else if args.network_profile.is_some() || !args.proxy_allow.is_empty() {
+    } else if args.has_proxy_flags() {
         // CLI proxy flags override profile network settings.
         // bind_ports come from --allow-bind CLI flag.
         caps.set_network_mode_mut(nono::NetworkMode::ProxyOnly {

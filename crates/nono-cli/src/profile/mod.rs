@@ -366,6 +366,15 @@ pub struct NetworkConfig {
     pub custom_credentials: HashMap<String, CustomCredentialDef>,
 }
 
+impl NetworkConfig {
+    /// Whether any profile setting requires proxy mode activation.
+    pub fn has_proxy_flags(&self) -> bool {
+        self.network_profile.is_some()
+            || !self.proxy_allow.is_empty()
+            || !self.proxy_credentials.is_empty()
+    }
+}
+
 /// Secrets configuration in a profile
 ///
 /// Maps keystore account names to environment variable names.
