@@ -63,23 +63,23 @@ nono run --read-file ./config.toml -- command
 
 ## Network Access
 
-Network is **allowed by default**. Use `--net-block` to disable outbound connections:
+Network is **allowed by default**. Use `--block-net` to disable outbound connections:
 
 ```bash
-nono run --allow . --net-block -- cargo build
+nono run --allow . --block-net -- cargo build
 ```
 
-For granular control, use `--network-profile` for host-level filtering, `--net-allow` to override proxy filtering for one session, or `--allow-port` for localhost IPC between sandboxes:
+For granular control, use `--network-profile` for host-level filtering, `--allow-net` to override proxy filtering for one session, or `--allow-port` for localhost IPC between sandboxes:
 
 ```bash
 # Host-level filtering via proxy
 nono run --allow . --network-profile claude-code -- my-agent
 
 # Keep a built-in profile but temporarily disable its proxy filtering
-nono run --profile claude-code --net-allow -- claude
+nono run --profile claude-code --allow-net -- claude
 
 # Localhost IPC (e.g., MCP server on port 3000)
-nono run --net-block --allow-port 3000 --allow . -- my-agent
+nono run --block-net --allow-port 3000 --allow . -- my-agent
 ```
 
 See [Network Filtering](/cli/features/network-proxy) and [CLI Reference](/cli/usage/flags) for details.

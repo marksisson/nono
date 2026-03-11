@@ -32,9 +32,9 @@ fn env_nono_allow_comma_separated() {
 }
 
 #[test]
-fn env_nono_net_block() {
+fn env_nono_block_net() {
     let output = nono_bin()
-        .env("NONO_NET_BLOCK", "1")
+        .env("NONO_BLOCK_NET", "1")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
@@ -47,17 +47,32 @@ fn env_nono_net_block() {
 }
 
 #[test]
-fn env_nono_net_block_accepts_true() {
+fn env_nono_block_net_accepts_true() {
     let output = nono_bin()
-        .env("NONO_NET_BLOCK", "true")
+        .env("NONO_BLOCK_NET", "true")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
 
     assert!(
         output.status.success(),
-        "NONO_NET_BLOCK=true should be accepted, stderr: {}",
+        "NONO_BLOCK_NET=true should be accepted, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn legacy_env_nono_net_block_still_works() {
+    let output = nono_bin()
+        .env("NONO_NET_BLOCK", "1")
+        .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
+        .output()
+        .expect("failed to run nono");
+
+    let text = combined_output(&output);
+    assert!(
+        text.contains("blocked"),
+        "expected legacy NONO_NET_BLOCK to still block network, got:\n{text}"
     );
 }
 
@@ -162,24 +177,24 @@ fn env_nono_external_proxy_bypass_requires_external_proxy() {
 }
 
 #[test]
-fn env_net_allow_conflicts_with_external_proxy() {
-    // NONO_NET_ALLOW + NONO_EXTERNAL_PROXY should conflict at the clap level.
+fn env_allow_net_conflicts_with_external_proxy() {
+    // NONO_ALLOW_NET + NONO_EXTERNAL_PROXY should conflict at the clap level.
     let output = nono_bin()
         .env("NONO_EXTERNAL_PROXY", "squid.corp:3128")
-        .env("NONO_NET_ALLOW", "true")
+        .env("NONO_ALLOW_NET", "true")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
 
     assert!(
         !output.status.success(),
-        "NONO_NET_ALLOW + NONO_EXTERNAL_PROXY should conflict"
+        "NONO_ALLOW_NET + NONO_EXTERNAL_PROXY should conflict"
     );
 }
 
 #[test]
-fn net_allow_overrides_profile_external_proxy() {
-    // A profile with external_proxy should be overridden by --net-allow,
+fn allow_net_overrides_profile_external_proxy() {
+    // A profile with external_proxy should be overridden by --allow-net,
     // resulting in unrestricted network (no proxy mode activation).
     let dir = tempfile::tempdir().expect("tmpdir");
     let profile_path = dir.path().join("ext-proxy-profile.json");
@@ -197,7 +212,7 @@ fn net_allow_overrides_profile_external_proxy() {
             "run",
             "--profile",
             profile_path.to_str().expect("valid utf8"),
-            "--net-allow",
+            "--allow-net",
             "--allow",
             "/tmp",
             "--dry-run",
@@ -209,7 +224,7 @@ fn net_allow_overrides_profile_external_proxy() {
     let text = combined_output(&output);
     assert!(
         output.status.success(),
-        "--net-allow should override profile external_proxy, stderr: {text}"
+        "--allow-net should override profile external_proxy, stderr: {text}"
     );
     // Should show "allowed" network, not proxy mode
     assert!(
@@ -219,16 +234,16 @@ fn net_allow_overrides_profile_external_proxy() {
 }
 
 #[test]
-fn env_conflict_net_allow_and_net_block() {
+fn env_conflict_allow_net_and_block_net() {
     let output = nono_bin()
-        .env("NONO_NET_ALLOW", "true")
-        .env("NONO_NET_BLOCK", "true")
+        .env("NONO_ALLOW_NET", "true")
+        .env("NONO_BLOCK_NET", "true")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
 
     assert!(
         !output.status.success(),
-        "NONO_NET_ALLOW + NONO_NET_BLOCK should conflict"
+        "NONO_ALLOW_NET + NONO_BLOCK_NET should conflict"
     );
 }
