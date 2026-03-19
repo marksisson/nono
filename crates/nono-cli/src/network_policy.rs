@@ -256,6 +256,7 @@ pub fn resolve_credentials(
                         crate::policy::expand_path(p).map(|pb| pb.to_string_lossy().into_owned())
                     })
                     .transpose()?,
+                oauth2: None,
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -286,6 +287,7 @@ pub fn resolve_credentials(
                 tls_ca: None, // Built-in credentials don't support custom CAs
                 tls_client_cert: None,
                 tls_client_key: None,
+                oauth2: None,
             });
         }
         // We already validated existence above, so this else branch won't be hit
