@@ -797,13 +797,19 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     // symlinks are resolved consistently with capability resolved paths.
     if let Some(ref dest) = run_args.rollback_dest {
         let dest_abs = {
-            let mut p = dest.clone();
+            let mut p = if dest.is_absolute() {
+                dest.clone()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?
+                    .join(dest)
+            };
             loop {
                 match p.canonicalize() {
                     Ok(canonical) => break canonical,
                     Err(_) => match p.parent() {
                         Some(parent) => p = parent.to_path_buf(),
-                        None => break dest.clone(),
+                        None => break p,
                     },
                 }
             }
