@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.23.1] - 2026-03-25
+
+### Bug Fixes
+
+- Block Unix socket connections via add_deny_access; add add_deny_commands (#488) ([#488](https://github.com/always-further/nono/pull/488))
+
+- Handle relative paths in --rollback-dest pre-check (#486) ([#486](https://github.com/always-further/nono/pull/486))
+
 ## [0.23.0] - 2026-03-24
 
 ### Dependencies
