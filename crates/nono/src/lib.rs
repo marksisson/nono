@@ -59,8 +59,8 @@ pub mod undo;
 
 // Re-exports for convenience
 pub use capability::{
-    AccessMode, CapabilitySet, CapabilitySource, FsCapability, NetworkMode, ProcessInfoMode,
-    SignalMode,
+    AccessMode, CapabilitySet, CapabilitySource, FsCapability, IpcMode, NetworkMode,
+    ProcessInfoMode, SignalMode,
 };
 pub use diagnostic::{
     CommandContext, DenialReason, DenialRecord, DiagnosticFormatter, DiagnosticMode,
@@ -77,10 +77,9 @@ pub use sandbox::{detect_abi, DetectedAbi};
 pub use sandbox::{Sandbox, SupportInfo};
 pub use state::SandboxState;
 pub use supervisor::{
-    ApprovalBackend, ApprovalDecision, CapabilityRequest, NeverGrantChecker, SupervisorSocket,
-    UrlOpenRequest,
+    ApprovalBackend, ApprovalDecision, CapabilityRequest, SupervisorSocket, UrlOpenRequest,
 };
 pub use trust::{
-    Enforcement, InstructionPatterns, Publisher, SignerIdentity, TrustPolicy, VerificationOutcome,
+    Enforcement, IncludePatterns, Publisher, SignerIdentity, TrustPolicy, VerificationOutcome,
     VerificationResult,
 };

@@ -3,7 +3,7 @@ title: Attestation Internals
 description: Sigstore-based cryptographic attestation format and verification pipeline
 ---
 
-This page covers the internal design of nono's instruction file attestation system. For usage instructions, see [Instruction File Trust](/cli/features/trust).
+This page covers the internal design of nono's attestation system. For usage instructions, see [Trust & Attestation](/cli/features/trust).
 
 ## Attestation Format
 
@@ -54,7 +54,7 @@ The DSSE payload is an [in-toto v1 attestation statement](https://github.com/in-
 }
 ```
 
-The `subject` binds the statement to a specific file by name and SHA-256 digest. The `predicateType` identifies this as a nono instruction file attestation. Trust policy signatures use a separate predicate type: `https://nono.sh/attestation/trust-policy/v1`.
+The `subject` binds the statement to a specific file by name and SHA-256 digest. The `predicateType` identifies this as a nono file attestation. Trust policy signatures use a separate predicate type: `https://nono.sh/attestation/trust-policy/v1`.
 
 For keyless signing, the predicate carries OIDC provenance:
 
@@ -122,13 +122,13 @@ For keyed bundles, the public key is loaded from the system keystore and the ECD
 
 ### Pre-exec Scan
 
-Before fork/exec, nono scans the working directory for files matching `instruction_patterns`. This is the baseline -- it catches instruction files present at session start. If any file fails verification and enforcement is `deny`, the process never starts.
+Before fork/exec, nono scans the working directory for files matching `includes`. File discovery intentionally does **not** respect `.gitignore` — adding a file to `.gitignore` cannot bypass trust verification. To avoid pathological startup cost in large repos, the walker skips a fixed set of heavy directories such as `.git`, `node_modules`, `target`, `dist`, and common caches, plus any user-configured `--skip-dir` / `skipdirs` entries. Other hidden directories remain visible to the scan. This is the baseline -- it catches files present at session start. If any file fails verification and enforcement is `deny`, the process never starts.
 
 The pre-exec scan also verifies the trust policy's own signature before trusting it.
 
 ### Seccomp-Notify (Linux Runtime)
 
-On Linux in [Supervised mode](/cli/features/supervisor), the seccomp-notify supervisor already traps `openat`/`openat2` syscalls for capability expansion. When the target path matches an instruction file pattern, the trust interceptor runs verification before the normal approval flow.
+On Linux in [Supervised mode](/cli/features/supervisor), the seccomp-notify supervisor already traps `openat`/`openat2` syscalls for capability expansion. When the target path matches an include pattern, the trust interceptor runs verification before the normal approval flow.
 
 The interceptor:
 1. Reads the file content from disk (the supervisor has unrestricted access)
@@ -139,24 +139,17 @@ The interceptor:
 
 A TOCTOU re-verification step ensures the digest of the opened file descriptor matches the digest verified during the trust check. This prevents a race where the file is swapped between verification and the fd injection.
 
-### Seatbelt Deny Rules (macOS Runtime)
+### Seatbelt Write-Protection (macOS)
 
-On macOS, instruction file patterns are enforced at the kernel level using Seatbelt rule specificity. During sandbox profile generation:
+On macOS, verified files are write-protected at the kernel level using literal Seatbelt deny rules. During sandbox profile generation:
 
-1. Each instruction pattern is converted to a Seatbelt regex (e.g., `SKILLS*` becomes `#"/SKILLS[^/]*$"`)
-2. A `(deny file-read-data (regex ...))` rule is emitted for each pattern
-3. For each file that passed the pre-exec trust scan, a `(allow file-read-data (literal "/full/path"))` rule is emitted
+1. The pre-exec trust scan verifies all files matching `includes` in the trust policy
+2. For each file that passed verification, a `(deny file-write-data (literal "/full/path"))` rule is emitted
+3. If the path involves a symlink (e.g., `/tmp` → `/private/tmp`), rules are emitted for both the original and canonical paths
 
-Seatbelt literal-allow rules override regex-deny rules (more specific wins). Files that were not present or did not pass the pre-exec scan have no literal-allow rule and remain blocked by the deny-regex.
+This makes verified files structurally immutable — the sandboxed process cannot modify them even though the parent directory may have write access granted. The pre-exec scan gates execution, aborting if any existing file fails verification.
 
-Glob-to-regex conversion:
-
-| Glob | Seatbelt Regex |
-|------|---------------|
-| `SKILLS*` | `/SKILLS[^/]*$` |
-| `CLAUDE*` | `/CLAUDE[^/]*$` |
-| `AGENT*` | `/AGENT[^/]*$` |
-| `.claude/**/*.md` | `/\.claude/.*/[^/]*\.md$` |
+Unlike Linux (where seccomp-notify intercepts every `openat()` at runtime), macOS trust verification is startup-only. Files matching `includes` that appear after sandbox application are not verified before the agent reads them. The macOS enforcement boundary is: integrity of files verified at startup, not runtime interception of all file opens.
 
 ## Verification Cache
 
@@ -174,7 +167,7 @@ If any component of the cache key changes (file modified, replaced, moved), the 
 
 The trust policy itself must be signed to establish a root of trust. Without this, an attacker who can write to the project directory can modify `trust-policy.json` to add themselves as a publisher or weaken enforcement.
 
-Policy bundles use the predicate type `https://nono.sh/attestation/trust-policy/v1` to distinguish them from instruction file bundles.
+Policy bundles use the predicate type `https://nono.sh/attestation/trust-policy/v1` to distinguish them from file attestation bundles.
 
 During pre-exec scan, policy signature verification runs first:
 
@@ -195,12 +188,12 @@ Multiple trust policies merge with additive-only semantics:
 
 | Field | Merge Strategy |
 |-------|---------------|
-| `instruction_patterns` | Union |
+| `includes` | Union |
 | `publishers` | Union |
 | `blocklist.digests` | Union |
 | `enforcement` | Strictest wins (`deny` > `warn` > `audit`) |
 
-Project-level policy cannot weaken user-level or embedded policy. A malicious project's `trust-policy.json` can add publishers but cannot remove blocklist entries, remove instruction patterns, or downgrade enforcement.
+Project-level policy cannot weaken user-level or embedded policy. A malicious project's `trust-policy.json` can add publishers but cannot remove blocklist entries, remove include patterns, or downgrade enforcement.
 
 ## Codebase Layout
 
@@ -214,7 +207,7 @@ Attestation primitives reusable by all language bindings.
 | `digest.rs` | SHA-256 digest computation (file and bytes) |
 | `dsse.rs` | DSSE envelope parsing/construction, PAE, in-toto statements |
 | `bundle.rs` | Sigstore bundle verification, Fulcio cert identity extraction |
-| `policy.rs` | Trust policy loading, merging, evaluation, instruction file discovery |
+| `policy.rs` | Trust policy loading, merging, evaluation, file discovery |
 | `signing.rs` | ECDSA P-256 key generation, keyed signing, bundle construction |
 
 ### CLI (`crates/nono-cli/src/`)
@@ -224,13 +217,13 @@ Attestation primitives reusable by all language bindings.
 | `trust_cmd.rs` | `nono trust` subcommand handlers |
 | `trust_scan.rs` | Pre-exec scan, policy signature verification |
 | `trust_intercept.rs` | Runtime trust interceptor (cache, verification dispatch) |
-| `instruction_deny.rs` | macOS Seatbelt deny rule generation (glob-to-regex) |
+| `instruction_deny.rs` | macOS Seatbelt write-protection for verified files |
 
 ## Security Properties
 
-**Verification before ingestion.** The pre-exec scan and runtime interception both ensure the agent never sees content that failed verification. If the agent reads the file before verification completes, the injection has already succeeded.
+**Verification before ingestion.** On Linux, the pre-exec scan and seccomp-notify runtime interception together ensure the agent never sees content that failed verification — files present at startup and files that appear mid-session are both verified before the agent can read them. On macOS, verification is startup-only: files present at launch are verified, and verified files are write-protected, but files that appear mid-session are not intercepted (see [Seatbelt Write-Protection](#seatbelt-write-protection-macos) above). To mitigate this on macOS, literal patterns in the trust policy that have no matching file at startup cause a hard failure in `deny` mode.
 
-**No trust-on-first-use.** A file must have a valid signature from a trusted publisher on first encounter. TOFU creates a window where the first encounter is untrusted, which is the supply chain attack scenario this defends against.
+**No trust-on-first-use (Linux).** On Linux, a file must have a valid signature from a trusted publisher on first encounter — seccomp-notify intercepts the `openat()` syscall before the read completes. On macOS, this guarantee applies only to files present at startup.
 
 **Blocklist before crypto.** A known-malicious file is denied even if it has a valid signature. This handles the case of a legitimately-signed file that is later discovered to be malicious.
 

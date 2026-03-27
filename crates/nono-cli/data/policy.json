@@ -3,50 +3,6 @@
     "version": 3,
     "schema_version": "3.0"
   },
-  "never_grant": [
-    "/etc/shadow",
-    "/etc/sudoers",
-    "/etc/passwd",
-    "/etc/master.passwd",
-    "/etc/security",
-    "/private/etc/shadow",
-    "/private/etc/sudoers",
-    "/private/etc/master.passwd",
-    "/var/db/dslocal",
-    "/boot",
-    "/boot/grub",
-    "/System/Library/LaunchDaemons",
-    "/System/Library/LaunchAgents",
-    "/Library/LaunchDaemons",
-    "/Library/LaunchAgents",
-    "~/.ssh/authorized_keys",
-    "~/.ssh/id_rsa",
-    "~/.ssh/id_ed25519",
-    "~/.ssh/id_ecdsa",
-    "~/.ssh/id_dsa",
-    "~/.gnupg",
-    "/proc/kcore",
-    "/proc/kmem"
-  ],
-  "base_groups": [
-    "deny_credentials",
-    "deny_keychains_macos",
-    "deny_keychains_linux",
-    "deny_browser_data_macos",
-    "deny_browser_data_linux",
-    "deny_macos_private",
-    "deny_shell_history",
-    "deny_shell_configs",
-    "system_read_macos",
-    "system_read_linux",
-    "system_write_macos",
-    "system_write_linux",
-    "user_tools",
-    "homebrew",
-    "dangerous_commands",
-    "dangerous_commands_macos",
-    "dangerous_commands_linux"
-  ],
   "groups": {
     "deny_credentials": {
       "description": "Block access to cryptographic keys, tokens, and cloud credentials",
@@ -247,7 +203,22 @@
           "/usr/lib/aarch64-linux-gnu",
           "/usr/local/lib",
           "/usr/local/lib64",
-          "/etc",
+          "/etc/resolv.conf",
+          "/etc/hosts",
+          "/etc/nsswitch.conf",
+          "/etc/gai.conf",
+          "/etc/ssl",
+          "/etc/ca-certificates",
+          "/etc/ld.so.cache",
+          "/etc/ld.so.conf",
+          "/etc/ld.so.conf.d",
+          "/etc/localtime",
+          "/etc/timezone",
+          "/etc/locale.conf",
+          "/etc/locale.gen",
+          "/etc/alternatives",
+          "/etc/os-release",
+          "/etc/services",
           "/usr/share",
           "/usr/share/locale",
           "/usr/share/locale-langpack",
@@ -268,7 +239,13 @@
           "/dev/stderr",
           "/dev/fd",
           "/dev/pts",
-          "/proc",
+          "/proc/self",
+          "/proc/cpuinfo",
+          "/proc/meminfo",
+          "/proc/stat",
+          "/proc/loadavg",
+          "/proc/version",
+          "/proc/filesystems",
           "/sys",
           "/run",
           "/var/run",
@@ -301,6 +278,11 @@
           "/dev/zero",
           "/dev/full",
           "/dev/tty",
+          "/dev/stdout",
+          "/dev/stderr",
+          "/dev/fd",
+          "/dev/pts",
+          "/proc/self/fd",
           "$TMPDIR"
         ]
       }
@@ -478,6 +460,16 @@
         ]
       }
     },
+    "git_config": {
+      "description": "Read access to git configuration files",
+      "allow": {
+        "read": [
+          "$HOME/.gitconfig",
+          "$HOME/.gitignore_global",
+          "$HOME/.config/git/ignore"
+        ]
+      }
+    },
     "unlink_protection": {
       "description": "Block file deletion globally, override for user-writable paths",
       "deny": {
@@ -507,6 +499,7 @@
           "su",
           "doas",
           "pip",
+          "npm",
           "kill",
           "killall",
           "pkill",
@@ -558,7 +551,42 @@
     }
   },
   "profiles": {
+    "default": {
+      "meta": {
+        "name": "default",
+        "version": "1.0.0",
+        "description": "Default conservative base profile",
+        "author": "nono-project"
+      },
+      "security": {
+        "groups": [
+          "deny_credentials",
+          "deny_keychains_macos",
+          "deny_keychains_linux",
+          "deny_browser_data_macos",
+          "deny_browser_data_linux",
+          "deny_macos_private",
+          "deny_shell_history",
+          "deny_shell_configs",
+          "system_read_macos",
+          "system_read_linux",
+          "system_write_macos",
+          "system_write_linux",
+          "user_tools",
+          "homebrew",
+          "dangerous_commands",
+          "dangerous_commands_macos",
+          "dangerous_commands_linux"
+        ],
+        "signal_mode": "isolated"
+      },
+      "filesystem": {},
+      "network": { "block": false },
+      "workdir": { "access": "none" },
+      "interactive": false
+    },
     "claude-code": {
+      "extends": "default",
       "meta": {
         "name": "claude-code",
         "version": "1.0.0",
@@ -577,16 +605,15 @@
           "vscode_macos",
           "vscode_linux",
           "nix_runtime",
+          "git_config",
           "unlink_protection"
         ],
         "signal_mode": "isolated",
         "capability_elevation": false
       },
-      "trust_groups": [],
       "filesystem": {
         "allow": ["$HOME/.claude"],
-        "allow_file": ["$HOME/.claude.json", "$HOME/.claude.json.lock"],
-        "read_file": ["$HOME/.gitconfig", "$HOME/.gitignore_global", "$HOME/.config/git/ignore"]
+        "allow_file": ["$HOME/.claude.json", "$HOME/.claude.json.lock"]
       },
       "network": { "block": false },
       "workdir": { "access": "readwrite" },
@@ -611,6 +638,7 @@
       "interactive": true
     },
     "codex": {
+      "extends": "default",
       "meta": {
         "name": "codex",
         "version": "1.0.0",
@@ -624,12 +652,12 @@
           "rust_runtime",
           "python_runtime",
           "nix_runtime",
+          "git_config",
           "unlink_protection"
         ],
         "signal_mode": "isolated",
         "capability_elevation": false
       },
-      "trust_groups": [],
       "filesystem": {
         "allow": ["$HOME/.codex"]
       },
@@ -645,6 +673,7 @@
       "interactive": true
     },
     "openclaw": {
+      "extends": "default",
       "meta": {
         "name": "openclaw",
         "version": "1.0.0",
@@ -655,7 +684,6 @@
         "groups": ["node_runtime"],
         "signal_mode": "isolated"
       },
-      "trust_groups": [],
       "filesystem": {
         "allow": [
           "$HOME/.openclaw",
@@ -672,6 +700,7 @@
       "interactive": false
     },
     "opencode": {
+      "extends": "default",
       "meta": {
         "name": "opencode",
         "version": "1.0.0",
@@ -679,12 +708,12 @@
         "author": "nono-project"
       },
       "security": {
-        "groups": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "unlink_protection"],
+        "groups": ["user_caches_macos", "user_caches_linux", "node_runtime", "opencode_linux", "git_config", "unlink_protection"],
         "signal_mode": "isolated"
       },
-      "trust_groups": [],
       "filesystem": {
         "allow": [
+          "$HOME/.opencode",
           "$HOME/.config/opencode",
           "$HOME/.cache/opencode",
           "$HOME/.local/share/opencode",
@@ -699,6 +728,7 @@
       "interactive": true
     },
     "python-dev": {
+      "extends": "default",
       "meta": {
         "name": "python-dev",
         "version": "1.0.0",
@@ -707,15 +737,16 @@
       },
       "security": {
         "groups": ["python_runtime"],
-        "signal_mode": "isolated"
+        "signal_mode": "isolated",
+        "ipc_mode": "full"
       },
-      "trust_groups": [],
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
       "workdir": { "access": "readwrite" },
       "interactive": false
     },
     "node-dev": {
+      "extends": "default",
       "meta": {
         "name": "node-dev",
         "version": "1.0.0",
@@ -726,13 +757,13 @@
         "groups": ["node_runtime"],
         "signal_mode": "isolated"
       },
-      "trust_groups": [],
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
       "workdir": { "access": "readwrite" },
       "interactive": false
     },
     "go-dev": {
+      "extends": "default",
       "meta": {
         "name": "go-dev",
         "version": "1.0.0",
@@ -743,13 +774,13 @@
         "groups": ["go_runtime"],
         "signal_mode": "isolated"
       },
-      "trust_groups": [],
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
       "workdir": { "access": "readwrite" },
       "interactive": false
     },
     "rust-dev": {
+      "extends": "default",
       "meta": {
         "name": "rust-dev",
         "version": "1.0.0",
@@ -760,13 +791,13 @@
         "groups": ["rust_runtime"],
         "signal_mode": "isolated"
       },
-      "trust_groups": [],
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
       "workdir": { "access": "readwrite" },
       "interactive": false
     },
     "swival": {
+      "extends": "default",
       "meta": {
         "name": "swival",
         "version": "1.0.0",
@@ -779,18 +810,17 @@
           "node_runtime",
           "user_caches_macos",
           "user_caches_linux",
+          "git_config",
           "unlink_protection"
         ],
         "signal_mode": "isolated",
         "capability_elevation": false
       },
-      "trust_groups": [],
       "filesystem": {
         "allow": [
           "$HOME/.config/swival",
           "$HOME/.local/share/swival"
-        ],
-        "read_file": ["$HOME/.gitconfig", "$HOME/.gitignore_global", "$HOME/.config/git/ignore"]
+        ]
       },
       "network": { "block": false },
       "workdir": { "access": "readwrite" },

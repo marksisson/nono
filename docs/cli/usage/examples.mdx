@@ -257,10 +257,10 @@ nono run --profile claude-code --read /tmp/extra -- claude
 nono run --profile claude-code --workdir ./my-project -- claude
 ```
 
-### Temporarily Bypass Profile Network Filtering
+### Restrict Profile to Specific Domains
 
 ```bash
-nono run --profile claude-code --allow-net -- claude
+nono run --profile claude-code --allow-domain api.openai.com -- claude
 ```
 
 ## Real-World Scenarios
@@ -335,11 +335,11 @@ Run an MCP server and a client in separate sandboxes, communicating over localho
 
 ```bash
 # Terminal 1: MCP server on port 3000 (network blocked except IPC port)
-nono run --block-net --allow-port 3000 --allow ./mcp-server -- node server.js
+nono run --block-net --open-port 3000 --allow ./mcp-server -- node server.js
 
 # Terminal 2: Agent connects to the MCP server on port 3000
-nono run --block-net --allow-port 3000 --allow ./agent -- my-agent
+nono run --block-net --open-port 3000 --allow ./agent -- my-agent
 
 # With proxy filtering + localhost IPC
-nono run --network-profile claude-code --allow-port 3000 --allow-cwd -- claude
+nono run --network-profile claude-code --open-port 3000 --allow-cwd -- claude
 ```

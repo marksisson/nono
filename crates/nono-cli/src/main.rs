@@ -13,7 +13,9 @@ mod learn;
 mod network_policy;
 mod output;
 mod policy;
+mod policy_cmd;
 mod profile;
+mod profile_cmd;
 mod protected_paths;
 mod query_ext;
 mod rollback_commands;
@@ -26,6 +28,7 @@ mod terminal_approval;
 mod theme;
 mod trust_cmd;
 mod trust_intercept;
+mod trust_keystore;
 mod trust_scan;
 mod update_check;
 
@@ -40,14 +43,17 @@ use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 use profile::WorkdirAccess;
 use std::ffi::OsString;
 use std::os::unix::io::FromRawFd;
+use std::sync::Mutex;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
+    let legacy_network_warnings = collect_legacy_network_warnings();
     normalize_legacy_flag_env_vars();
     let cli = Cli::parse();
     init_tracing(&cli);
     init_theme(&cli);
+    print_legacy_network_warnings(&legacy_network_warnings, cli.silent);
 
     if let Err(e) = run(cli) {
         error!("{}", e);
@@ -59,6 +65,11 @@ fn main() {
 fn normalize_legacy_flag_env_vars() {
     copy_legacy_env_var("NONO_NET_BLOCK", "NONO_BLOCK_NET");
     copy_legacy_env_var("NONO_NET_ALLOW", "NONO_ALLOW_NET");
+    copy_legacy_env_var("NONO_ALLOW_PROXY", "NONO_ALLOW_DOMAIN");
+    copy_legacy_env_var("NONO_PROXY_ALLOW", "NONO_ALLOW_DOMAIN");
+    copy_legacy_env_var("NONO_PROXY_CREDENTIAL", "NONO_CREDENTIAL");
+    copy_legacy_env_var("NONO_EXTERNAL_PROXY", "NONO_UPSTREAM_PROXY");
+    copy_legacy_env_var("NONO_EXTERNAL_PROXY_BYPASS", "NONO_UPSTREAM_BYPASS");
 }
 
 fn copy_legacy_env_var(old: &str, new: &str) {
@@ -68,6 +79,64 @@ fn copy_legacy_env_var(old: &str, new: &str) {
 
     if let Some(value) = std::env::var_os(old) {
         std::env::set_var(new, value);
+    }
+}
+
+fn collect_legacy_network_warnings() -> Vec<String> {
+    let mut warnings = Vec::new();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    for (legacy, replacement) in [
+        ("--allow-net", Some("network is unrestricted by default")),
+        ("--net-allow", Some("network is unrestricted by default")),
+        ("--allow-proxy", Some("--allow-domain")),
+        ("--proxy-allow", Some("--allow-domain")),
+        ("--proxy-credential", Some("--credential")),
+        ("--allow-bind", Some("--listen-port")),
+        ("--allow-port", Some("--open-port")),
+        ("--external-proxy", Some("--upstream-proxy")),
+        ("--external-proxy-bypass", Some("--upstream-bypass")),
+        ("--net-block", Some("--block-net")),
+    ] {
+        if args
+            .iter()
+            .any(|arg| arg == legacy || arg.starts_with(&format!("{legacy}=")))
+        {
+            let message = if let Some(replacement) = replacement {
+                format!("Warning: `{legacy}` is deprecated; use `{replacement}` instead.")
+            } else {
+                format!("Warning: `{legacy}` is deprecated.")
+            };
+            warnings.push(message);
+        }
+    }
+
+    for (legacy, replacement) in [
+        ("NONO_NET_BLOCK", "NONO_BLOCK_NET"),
+        ("NONO_NET_ALLOW", "NONO_ALLOW_NET"),
+        ("NONO_ALLOW_PROXY", "NONO_ALLOW_DOMAIN"),
+        ("NONO_PROXY_ALLOW", "NONO_ALLOW_DOMAIN"),
+        ("NONO_PROXY_CREDENTIAL", "NONO_CREDENTIAL"),
+        ("NONO_EXTERNAL_PROXY", "NONO_UPSTREAM_PROXY"),
+        ("NONO_EXTERNAL_PROXY_BYPASS", "NONO_UPSTREAM_BYPASS"),
+    ] {
+        if std::env::var_os(legacy).is_some() {
+            warnings.push(format!(
+                "Warning: `{legacy}` is deprecated; use `{replacement}` instead."
+            ));
+        }
+    }
+
+    warnings
+}
+
+fn print_legacy_network_warnings(warnings: &[String], silent: bool) {
+    if silent {
+        return;
+    }
+
+    for warning in warnings {
+        eprintln!("  [nono] {warning}");
     }
 }
 
@@ -82,10 +151,26 @@ fn init_theme(cli: &Cli) {
 }
 
 fn init_tracing(cli: &Cli) {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_filter(cli))
-        .with_target(false)
-        .init();
+    let builder = || {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_filter(cli))
+            .with_target(false)
+    };
+
+    if let Some(path) = &cli.log_file {
+        match std::fs::File::create(path) {
+            Ok(file) => {
+                let writer = Mutex::new(file);
+                builder().with_ansi(false).with_writer(writer).init();
+            }
+            Err(e) => {
+                eprintln!("nono: failed to open log file {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    } else {
+        builder().init();
+    }
 }
 
 fn tracing_filter(cli: &Cli) -> EnvFilter {
@@ -120,6 +205,8 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Rollback(_)
         | Commands::Trust(_)
         | Commands::Audit(_)
+        | Commands::Policy(_)
+        | Commands::Profile(_)
         | Commands::OpenUrlHelper(_) => 0,
     }
 }
@@ -154,6 +241,7 @@ fn run(cli: Cli) -> Result<()> {
             run_why(*args)
         }
         Commands::Setup(args) => {
+            output::print_banner(cli.silent);
             show_update_notification(&mut update_handle, cli.silent);
             run_setup(args)
         }
@@ -168,6 +256,14 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Audit(args) => {
             show_update_notification(&mut update_handle, cli.silent);
             audit_commands::run_audit(args)
+        }
+        Commands::Policy(args) => {
+            show_update_notification(&mut update_handle, cli.silent);
+            policy_cmd::run_policy(args)
+        }
+        Commands::Profile(args) => {
+            show_update_notification(&mut update_handle, cli.silent);
+            profile_cmd::run_profile(args)
         }
         Commands::OpenUrlHelper(args) => run_open_url_helper(args),
     }
@@ -392,11 +488,16 @@ fn run_why(args: WhyArgs) -> Result<()> {
     use query_ext::{print_result, query_network, query_path, QueryResult};
     use sandbox_state::load_sandbox_state;
 
-    // Build capability set from args or load from sandbox state
-    let caps = if args.self_query {
+    // Build capability set from args or load from sandbox state.
+    // Also collect overridden paths so the query can skip sensitive-path checks
+    // for paths that have been exempted via override_deny.
+    let (caps, overridden_paths): (CapabilitySet, Vec<std::path::PathBuf>) = if args.self_query {
         // Inside sandbox - load from state file
         match load_sandbox_state() {
-            Some(state) => state.to_caps()?,
+            Some(state) => {
+                let paths = state.override_deny_as_paths();
+                (state.to_caps()?, paths)
+            }
             None => {
                 let result = QueryResult::NotSandboxed {
                     message: "Not running inside a nono sandbox".to_string(),
@@ -421,7 +522,6 @@ fn run_why(args: WhyArgs) -> Result<()> {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        // Create a minimal SandboxArgs to pass to from_profile
         let sandbox_args = SandboxArgs {
             allow: args.allow.clone(),
             read: args.read.clone(),
@@ -430,36 +530,29 @@ fn run_why(args: WhyArgs) -> Result<()> {
             read_file: args.read_file.clone(),
             write_file: args.write_file.clone(),
             block_net: args.block_net,
-            allow_net: false,
-            network_profile: None,
-            allow_proxy: vec![],
-            proxy_credential: vec![],
-            external_proxy: None,
-            external_proxy_bypass: vec![],
-            override_deny: vec![],
-            allow_command: vec![],
-            block_command: vec![],
-            env_credential: None,
-            env_credential_map: vec![],
-            profile: None,
-            allow_cwd: false,
-            allow_launch_services: false,
             workdir: args.workdir.clone(),
-            config: None,
-            verbose: 0,
-            dry_run: false,
-            allow_bind: vec![],
-            allow_port: vec![],
-            proxy_port: None,
+            ..SandboxArgs::default()
         };
+
+        // Collect overridden paths from profile for the query
+        let mut override_paths = Vec::new();
+        for tmpl in &prof.policy.override_deny {
+            let expanded = profile::expand_vars(tmpl, &workdir)?;
+            if expanded.exists() {
+                if let Ok(c) = expanded.canonicalize() {
+                    override_paths.push(c);
+                }
+            } else {
+                override_paths.push(expanded);
+            }
+        }
 
         let (mut caps, needs_unlink) = CapabilitySet::from_profile(&prof, &workdir, &sandbox_args)?;
         if needs_unlink {
             crate::policy::apply_unlink_overrides(&mut caps);
         }
-        caps
+        (caps, override_paths)
     } else {
-        // Build from CLI args
         let sandbox_args = SandboxArgs {
             allow: args.allow.clone(),
             read: args.read.clone(),
@@ -468,34 +561,15 @@ fn run_why(args: WhyArgs) -> Result<()> {
             read_file: args.read_file.clone(),
             write_file: args.write_file.clone(),
             block_net: args.block_net,
-            allow_net: false,
-            network_profile: None,
-            allow_proxy: vec![],
-            proxy_credential: vec![],
-            external_proxy: None,
-            external_proxy_bypass: vec![],
-            override_deny: vec![],
-            allow_command: vec![],
-            block_command: vec![],
-            env_credential: None,
-            env_credential_map: vec![],
-            profile: None,
-            allow_cwd: false,
-            allow_launch_services: false,
             workdir: args.workdir.clone(),
-            config: None,
-            verbose: 0,
-            dry_run: false,
-            allow_bind: vec![],
-            allow_port: vec![],
-            proxy_port: None,
+            ..SandboxArgs::default()
         };
 
         let (mut caps, needs_unlink) = CapabilitySet::from_args(&sandbox_args)?;
         if needs_unlink {
             crate::policy::apply_unlink_overrides(&mut caps);
         }
-        caps
+        (caps, vec![])
     };
 
     // Execute the query
@@ -506,7 +580,7 @@ fn run_why(args: WhyArgs) -> Result<()> {
             Some(WhyOp::ReadWrite) => AccessMode::ReadWrite,
             None => AccessMode::Read, // Default to read
         };
-        query_path(path, op, &caps)?
+        query_path(path, op, &caps, &overridden_paths)?
     } else if let Some(ref host) = args.host {
         query_network(host, args.port, &caps)
     } else {
@@ -561,6 +635,8 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     }
 
     let mut prepared = prepare_sandbox(&args, silent)?;
+    let mut merged_skip_dirs = prepared.skip_dirs.clone();
+    merged_skip_dirs.extend(run_args.skip_dir.iter().cloned());
 
     if prepared.allow_launch_services_active {
         print_allow_launch_services_warning(silent);
@@ -591,8 +667,9 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
         }
         (None, None)
     } else {
-        let trust_policy = trust_scan::load_scan_policy(&scan_root, false)?;
-        let result = trust_scan::run_pre_exec_scan(&scan_root, &trust_policy, silent)?;
+        let trust_policy = trust_scan::load_scan_policy(&scan_root, false, &merged_skip_dirs)?;
+        let result =
+            trust_scan::run_pre_exec_scan(&scan_root, &trust_policy, silent, &merged_skip_dirs)?;
         if !result.results.is_empty() {
             info!(
                 "Trust scan: {} verified, {} blocked, {} warned ({} total files)",
@@ -609,15 +686,11 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
             });
         }
 
-        // Inject instruction file deny rules into the Seatbelt profile (macOS only).
-        // Deny-regex rules block reading any file matching instruction patterns.
-        // Literal allows re-enable reading for files that passed verification.
+        // Write-protect verified instruction files in the Seatbelt profile (macOS).
+        // Literal deny-write rules make verified files structurally immutable at the
+        // kernel level, preventing the agent from tampering with them mid-session.
         let verified = result.verified_paths();
-        instruction_deny::inject_instruction_deny_rules(
-            &mut prepared.caps,
-            &trust_policy,
-            &verified,
-        )?;
+        instruction_deny::write_protect_verified_files(&mut prepared.caps, &verified)?;
 
         // Add verified multi-subject files as read-only capabilities.
         // This makes the files structurally immutable post-sandbox on both
@@ -661,28 +734,29 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
 
     let effective_proxy = resolve_effective_proxy_settings(&args, &prepared);
     let network_profile = effective_proxy.network_profile;
-    let proxy_allow_hosts = effective_proxy.proxy_allow_hosts;
-    let proxy_credentials = effective_proxy.proxy_credentials;
+    let allow_domain = effective_proxy.allow_domain;
+    let credentials = effective_proxy.credentials;
+    let effective_listen_ports = merge_dedup_ports(&prepared.listen_ports, &args.allow_bind);
 
-    // Resolve effective external proxy: --allow-net clears it (same as other
+    // Resolve effective upstream proxy: --allow-net clears it (same as other
     // proxy settings), otherwise CLI overrides profile.
-    let effective_external_proxy = if args.allow_net {
+    let effective_upstream_proxy = if args.allow_net {
         None
     } else {
         args.external_proxy
             .clone()
-            .or_else(|| prepared.external_proxy.clone())
+            .or_else(|| prepared.upstream_proxy.clone())
     };
 
     // Resolve effective bypass hosts: cleared by --allow-net, otherwise
-    // CLI --external-proxy wins (use CLI bypass only), otherwise merge
+    // CLI --upstream-proxy wins (use CLI bypass only), otherwise merge
     // profile + CLI bypass hosts.
     let effective_bypass = if args.allow_net {
         Vec::new()
     } else if args.external_proxy.is_some() {
         args.external_proxy_bypass.clone()
     } else {
-        let mut bypass = prepared.external_proxy_bypass.clone();
+        let mut bypass = prepared.upstream_bypass.clone();
         bypass.extend(args.external_proxy_bypass.clone());
         bypass
     };
@@ -695,10 +769,10 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     // network is explicitly blocked, the proxy must NOT activate since that
     // would re-enable network access through the proxy's localhost listener.
     let proxy_active = if matches!(prepared.caps.network_mode(), nono::NetworkMode::Blocked) {
-        if !proxy_credentials.is_empty()
+        if !credentials.is_empty()
             || network_profile.is_some()
-            || !proxy_allow_hosts.is_empty()
-            || effective_external_proxy.is_some()
+            || !allow_domain.is_empty()
+            || effective_upstream_proxy.is_some()
         {
             warn!(
                 "--block-net is active; ignoring proxy configuration \
@@ -716,10 +790,10 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
         matches!(
             prepared.caps.network_mode(),
             nono::NetworkMode::ProxyOnly { .. }
-        ) || !proxy_credentials.is_empty()
+        ) || !credentials.is_empty()
             || network_profile.is_some()
-            || !proxy_allow_hosts.is_empty()
-            || effective_external_proxy.is_some()
+            || !allow_domain.is_empty()
+            || effective_upstream_proxy.is_some()
     };
 
     // Split --rollback-exclude values: glob metacharacters route to filename
@@ -733,6 +807,47 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
 
     let mut merged_globs = prepared.rollback_exclude_globs;
     merged_globs.extend(cli_exclude_globs);
+
+    // Precheck: if --rollback-dest was given, verify the destination (or a
+    // parent) is covered by a writable sandbox capability. Fail before the
+    // sandbox is locked in so the user gets a clear, actionable error.
+    //
+    // When the dest doesn't exist yet (will be created by create_dir_all),
+    // walk up to the nearest existing ancestor for canonicalization so that
+    // symlinks are resolved consistently with capability resolved paths.
+    if let Some(ref dest) = run_args.rollback_dest {
+        let dest_abs = {
+            let mut p = if dest.is_absolute() {
+                dest.clone()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?
+                    .join(dest)
+            };
+            loop {
+                match p.canonicalize() {
+                    Ok(canonical) => break canonical,
+                    Err(_) => match p.parent() {
+                        Some(parent) => p = parent.to_path_buf(),
+                        None => break p,
+                    },
+                }
+            }
+        };
+        let covered = prepared.caps.fs_capabilities().iter().any(|cap| {
+            matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
+                && dest_abs.starts_with(&cap.resolved)
+        });
+        if !covered {
+            eprintln!(
+                "nono: --rollback-dest '{}' is not covered by sandbox write permissions.\n\
+                 Add --allow {} to grant access, or omit --rollback-dest to use the default path (~/.nono/rollbacks/).",
+                dest.display(),
+                dest.display()
+            );
+            std::process::exit(1);
+        }
+    }
 
     // Select execution strategy. Supervised mode is needed when any feature
     // requires a parent process: rollback snapshots, network proxy, capability
@@ -753,6 +868,11 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
         prepared.secrets,
         ExecutionFlags {
             strategy,
+            workdir: args
+                .workdir
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
             no_diagnostics,
             rollback,
             no_rollback: run_args.no_rollback,
@@ -761,24 +881,28 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
             silent,
             rollback_all: run_args.rollback_all,
             rollback_include: run_args.rollback_include,
+            rollback_dest: run_args.rollback_dest,
             scan_root,
             trust_policy,
             trust_interception_active,
             protected_paths: verified_protected_paths,
             rollback_exclude_patterns: merged_patterns,
             rollback_exclude_globs: merged_globs,
+            skip_dirs: merged_skip_dirs,
             capability_elevation: prepared.capability_elevation,
             proxy_active,
             network_profile,
-            proxy_allow_hosts,
-            proxy_credentials,
+            allow_domain,
+            credentials,
             custom_credentials: prepared.custom_credentials,
-            external_proxy: effective_external_proxy,
-            external_proxy_bypass: effective_bypass,
-            allow_bind_ports: args.allow_bind,
+            upstream_proxy: effective_upstream_proxy,
+            upstream_bypass: effective_bypass,
+            allow_bind_ports: effective_listen_ports,
             proxy_port: args.proxy_port,
             open_url_origins: prepared.open_url_origins,
             open_url_allow_localhost: prepared.open_url_allow_localhost,
+            allow_launch_services_active: prepared.allow_launch_services_active,
+            override_deny_paths: prepared.override_deny_paths,
         },
     )
 }
@@ -841,8 +965,15 @@ fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
         prepared.caps,
         prepared.secrets,
         ExecutionFlags {
+            workdir: args
+                .sandbox
+                .workdir
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
             no_diagnostics: true,
             capability_elevation: prepared.capability_elevation,
+            override_deny_paths: prepared.override_deny_paths,
             ..ExecutionFlags::defaults(silent)?
         },
     )
@@ -851,24 +982,9 @@ fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 /// Apply sandbox and exec into command (nono disappears).
 /// For scripts, piping, and embedding where no parent process is wanted.
 fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
-    let args = wrap_args.sandbox;
+    let args: SandboxArgs = wrap_args.sandbox.into();
     let command = wrap_args.command;
     let no_diagnostics = wrap_args.no_diagnostics;
-
-    // Validate: proxy flags are incompatible with Direct mode (no parent to run proxy)
-    if args.network_profile.is_some()
-        || !args.allow_proxy.is_empty()
-        || !args.proxy_credential.is_empty()
-        || args.external_proxy.is_some()
-        || !args.external_proxy_bypass.is_empty()
-    {
-        return Err(NonoError::ConfigParse(
-            "nono wrap does not support proxy flags (--network-profile, --allow-proxy, \
-             --proxy-credential, --external-proxy, --external-proxy-bypass). \
-             Use `nono run` instead."
-                .to_string(),
-        ));
-    }
 
     if command.is_empty() {
         return Err(NonoError::NoCommand);
@@ -893,9 +1009,9 @@ fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let prepared = prepare_sandbox(&args, silent)?;
 
     // Also reject proxy flags that came from the profile (not just CLI).
-    // Profile-provided external_proxy / network settings activate ProxyOnly
+    // Profile-provided upstream_proxy / network settings activate ProxyOnly
     // mode, which requires a parent process that wrap doesn't provide.
-    if prepared.external_proxy.is_some()
+    if prepared.upstream_proxy.is_some()
         || matches!(
             prepared.caps.network_mode(),
             nono::NetworkMode::ProxyOnly { .. }
@@ -919,7 +1035,13 @@ fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
         prepared.secrets,
         ExecutionFlags {
             strategy: exec_strategy::ExecStrategy::Direct,
+            workdir: args
+                .workdir
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
             no_diagnostics,
+            override_deny_paths: prepared.override_deny_paths,
             ..ExecutionFlags::defaults(silent)?
         },
     )
@@ -928,6 +1050,7 @@ fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
 /// Flags controlling sandboxed execution behavior.
 struct ExecutionFlags {
     strategy: exec_strategy::ExecStrategy,
+    workdir: std::path::PathBuf,
     no_diagnostics: bool,
     rollback: bool,
     no_rollback: bool,
@@ -939,6 +1062,8 @@ struct ExecutionFlags {
     rollback_all: bool,
     /// Force-include specific directories that would otherwise be auto-excluded
     rollback_include: Vec<String>,
+    /// Custom destination directory for rollback snapshots (overrides ~/.nono/rollbacks/)
+    rollback_dest: Option<std::path::PathBuf>,
     /// Root directory for trust policy discovery and scanning
     scan_root: std::path::PathBuf,
     /// Loaded trust policy from the pre-exec scan path.
@@ -951,6 +1076,8 @@ struct ExecutionFlags {
     rollback_exclude_patterns: Vec<String>,
     /// Profile-specific rollback exclusion globs (filename matching)
     rollback_exclude_globs: Vec<String>,
+    /// Directory names to skip during trust scanning and rollback preflight.
+    skip_dirs: Vec<String>,
     /// Whether runtime capability elevation is enabled (seccomp-notify + PTY mux).
     /// When false, supervised mode runs with static capabilities only.
     capability_elevation: bool,
@@ -958,16 +1085,16 @@ struct ExecutionFlags {
     proxy_active: bool,
     /// Network profile name for proxy filtering (from --network-profile or profile config)
     network_profile: Option<String>,
-    /// Additional hosts to allow through the proxy (from --allow-proxy or profile config)
-    proxy_allow_hosts: Vec<String>,
-    /// Credential services for reverse proxy (from --proxy-credential or profile config)
-    proxy_credentials: Vec<String>,
+    /// Additional domains to allow through the proxy (from --allow-domain or profile config)
+    allow_domain: Vec<String>,
+    /// Credential services for reverse proxy (from --credential or profile config)
+    credentials: Vec<String>,
     /// Custom credential definitions from profile (merged with built-in during resolution)
     custom_credentials: std::collections::HashMap<String, profile::CustomCredentialDef>,
-    /// External proxy address (from --external-proxy)
-    external_proxy: Option<String>,
-    /// Hosts to bypass the external proxy (from --external-proxy-bypass)
-    external_proxy_bypass: Vec<String>,
+    /// Upstream proxy address (from --upstream-proxy)
+    upstream_proxy: Option<String>,
+    /// Hosts to bypass the upstream proxy (from --upstream-bypass)
+    upstream_bypass: Vec<String>,
     /// Ports the sandboxed process is allowed to bind (from --allow-bind)
     allow_bind_ports: Vec<u16>,
     /// Fixed port for the credential proxy (from --proxy-port)
@@ -976,6 +1103,10 @@ struct ExecutionFlags {
     open_url_origins: Vec<String>,
     /// Whether to allow http://localhost URL opens
     open_url_allow_localhost: bool,
+    /// Whether direct LaunchServices opening is enabled for this session.
+    allow_launch_services_active: bool,
+    /// Canonicalized paths exempted from deny groups via override_deny
+    override_deny_paths: Vec<std::path::PathBuf>,
 }
 
 impl ExecutionFlags {
@@ -985,6 +1116,8 @@ impl ExecutionFlags {
     fn defaults(silent: bool) -> Result<Self> {
         Ok(Self {
             strategy: exec_strategy::ExecStrategy::Supervised,
+            workdir: std::env::current_dir()
+                .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?,
             no_diagnostics: false,
             rollback: false,
             no_rollback: false,
@@ -993,6 +1126,7 @@ impl ExecutionFlags {
             silent,
             rollback_all: false,
             rollback_include: Vec::new(),
+            rollback_dest: None,
             scan_root: std::env::current_dir()
                 .map_err(|e| NonoError::SandboxInit(format!("Failed to get cwd: {e}")))?,
             trust_policy: None,
@@ -1000,31 +1134,34 @@ impl ExecutionFlags {
             protected_paths: Vec::new(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            skip_dirs: Vec::new(),
             capability_elevation: false,
             proxy_active: false,
             network_profile: None,
-            proxy_allow_hosts: Vec::new(),
-            proxy_credentials: Vec::new(),
+            allow_domain: Vec::new(),
+            credentials: Vec::new(),
             custom_credentials: std::collections::HashMap::new(),
-            external_proxy: None,
-            external_proxy_bypass: Vec::new(),
+            upstream_proxy: None,
+            upstream_bypass: Vec::new(),
             allow_bind_ports: Vec::new(),
             proxy_port: None,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
+            allow_launch_services_active: false,
+            override_deny_paths: Vec::new(),
         })
     }
 }
 
 fn trust_interception_active(policy: Option<&nono::trust::TrustPolicy>) -> bool {
-    policy.is_some_and(|policy| !policy.instruction_patterns.is_empty())
+    policy.is_some_and(|policy| !policy.includes.is_empty())
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct EffectiveProxySettings {
     network_profile: Option<String>,
-    proxy_allow_hosts: Vec<String>,
-    proxy_credentials: Vec<String>,
+    allow_domain: Vec<String>,
+    credentials: Vec<String>,
 }
 
 fn resolve_effective_proxy_settings(
@@ -1034,8 +1171,8 @@ fn resolve_effective_proxy_settings(
     if args.allow_net {
         return EffectiveProxySettings {
             network_profile: None,
-            proxy_allow_hosts: Vec::new(),
-            proxy_credentials: Vec::new(),
+            allow_domain: Vec::new(),
+            credentials: Vec::new(),
         };
     }
 
@@ -1043,33 +1180,41 @@ fn resolve_effective_proxy_settings(
         .network_profile
         .clone()
         .or_else(|| prepared.network_profile.clone());
-    let mut proxy_allow_hosts = prepared.proxy_allow_hosts.clone();
-    proxy_allow_hosts.extend(args.allow_proxy.clone());
-    let mut proxy_credentials = prepared.proxy_credentials.clone();
-    proxy_credentials.extend(args.proxy_credential.clone());
+    let mut allow_domain = prepared.allow_domain.clone();
+    allow_domain.extend(args.allow_proxy.clone());
+    let mut credentials = prepared.credentials.clone();
+    credentials.extend(args.proxy_credential.clone());
 
     EffectiveProxySettings {
         network_profile,
-        proxy_allow_hosts,
-        proxy_credentials,
+        allow_domain,
+        credentials,
     }
 }
 
 /// Validate that bypass hosts are not specified without an external proxy.
 /// Called from both the dry-run and live execution paths.
 fn validate_external_proxy_bypass(args: &SandboxArgs, prepared: &PreparedSandbox) -> Result<()> {
-    let has_bypass =
-        !args.external_proxy_bypass.is_empty() || !prepared.external_proxy_bypass.is_empty();
-    let has_external_proxy = args.external_proxy.is_some() || prepared.external_proxy.is_some();
+    let has_bypass = !args.external_proxy_bypass.is_empty() || !prepared.upstream_bypass.is_empty();
+    let has_external_proxy = args.external_proxy.is_some() || prepared.upstream_proxy.is_some();
 
     if has_bypass && !has_external_proxy {
         return Err(NonoError::ConfigParse(
-            "--external-proxy-bypass requires --external-proxy \
-             (or external_proxy in profile network config)"
+            "--upstream-bypass requires --upstream-proxy \
+             (or upstream_proxy in profile network config)"
                 .to_string(),
         ));
     }
     Ok(())
+}
+
+/// Merge two port lists, sort, and deduplicate.
+pub(crate) fn merge_dedup_ports(a: &[u16], b: &[u16]) -> Vec<u16> {
+    let mut ports = a.to_vec();
+    ports.extend_from_slice(b);
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// Apply sandbox pre-fork for Direct mode (both parent+child confined).
@@ -1086,7 +1231,10 @@ fn apply_pre_fork_sandbox(
         {
             let detected = Sandbox::detect_abi()?;
             info!("Direct mode: detected {}", detected);
-            Sandbox::apply_with_abi(caps, &detected)?;
+            let _fallback = Sandbox::apply_with_abi(caps, &detected)?;
+            // Direct mode cannot handle ProxyOnly fallback (no supervisor loop).
+            // If ProxyOnly was needed and Landlock couldn't handle it, apply()
+            // would have already failed with an error.
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -1124,7 +1272,7 @@ fn build_proxy_config_from_flags(
 
     // Merge profile credentials with CLI credentials (CLI takes precedence/adds to profile)
     let mut all_credentials = resolved.profile_credentials.clone();
-    for cred in &flags.proxy_credentials {
+    for cred in &flags.credentials {
         if !all_credentials.contains(cred) {
             all_credentials.push(cred.clone());
         }
@@ -1138,20 +1286,20 @@ fn build_proxy_config_from_flags(
     )?;
     resolved.routes = routes;
 
-    // Expand --allow-proxy entries: group names become their hosts,
+    // Expand --allow-domain entries: group names become their hosts,
     // literal hostnames pass through as-is.
-    let expanded_proxy_allow =
-        network_policy::expand_proxy_allow(&net_policy, &flags.proxy_allow_hosts);
+    let expanded_allow_domain =
+        network_policy::expand_proxy_allow(&net_policy, &flags.allow_domain);
 
     // Build the proxy config with expanded extra hosts
-    let mut proxy_config = network_policy::build_proxy_config(&resolved, &expanded_proxy_allow);
+    let mut proxy_config = network_policy::build_proxy_config(&resolved, &expanded_allow_domain);
 
-    // Wire in external proxy if specified
-    if let Some(ref addr) = flags.external_proxy {
+    // Wire in upstream proxy if specified
+    if let Some(ref addr) = flags.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
             address: addr.clone(),
             auth: None,
-            bypass_hosts: flags.external_proxy_bypass.clone(),
+            bypass_hosts: flags.upstream_bypass.clone(),
         });
     }
 
@@ -1166,6 +1314,25 @@ fn build_proxy_config_from_flags(
 fn cleanup_capability_state_file(cap_file_path: &std::path::Path) {
     if cap_file_path.exists() {
         let _ = std::fs::remove_file(cap_file_path);
+    }
+}
+
+fn execution_start_dir(
+    workdir: &std::path::Path,
+    caps: &CapabilitySet,
+) -> Result<std::path::PathBuf> {
+    let workdir_canonical =
+        workdir
+            .canonicalize()
+            .map_err(|e| NonoError::PathCanonicalization {
+                path: workdir.to_path_buf(),
+                source: e,
+            })?;
+
+    if caps.path_covered(&workdir_canonical) {
+        Ok(workdir_canonical)
+    } else {
+        Ok(std::path::PathBuf::from("/"))
     }
 }
 
@@ -1188,27 +1355,9 @@ fn execute_sandboxed(
         });
     }
 
-    // Detect if we're launching Claude Code and inject system prompt
-    let prompt_file_path = if is_claude_command(&program) {
-        write_system_prompt_file(flags.silent)
-    } else {
-        None
-    };
-
-    // Build extra args for Claude Code (--append-system-prompt-file)
-    let extra_args: Vec<OsString> = if let Some(ref prompt_path) = prompt_file_path {
-        vec![
-            OsString::from("--append-system-prompt-file"),
-            OsString::from(prompt_path),
-        ]
-    } else {
-        vec![]
-    };
-
     // Convert OsString command to String for exec_strategy
     let command: Vec<String> = std::iter::once(program.to_string_lossy().into_owned())
         .chain(cmd_args.iter().map(|s| s.to_string_lossy().into_owned()))
-        .chain(extra_args.iter().map(|s| s.to_string_lossy().into_owned()))
         .collect();
 
     if command.is_empty() {
@@ -1219,7 +1368,7 @@ fn execute_sandboxed(
     let resolved_program = exec_strategy::resolve_program(&command[0])?;
 
     // Write capability state file BEFORE applying sandbox
-    let cap_file = write_capability_state_file(&caps, flags.silent);
+    let cap_file = write_capability_state_file(&caps, &flags.override_deny_paths, flags.silent);
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
 
     // Validate that secret env var names are not dangerous (e.g. LD_PRELOAD).
@@ -1300,6 +1449,8 @@ fn execute_sandboxed(
         None
     };
 
+    let current_dir = execution_start_dir(&flags.workdir, &caps)?;
+
     // Apply sandbox BEFORE fork for Direct mode.
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
@@ -1341,6 +1492,21 @@ fn execute_sandboxed(
         strategy, threading
     );
 
+    // Determine whether the seccomp proxy-only fallback is needed.
+    // This must be decided before fork so both parent and child agree.
+    #[cfg(target_os = "linux")]
+    let seccomp_proxy_fallback = {
+        let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
+        if needs_proxy {
+            match Sandbox::detect_abi() {
+                Ok(detected) => !detected.has_network(),
+                Err(_) => false,
+            }
+        } else {
+            false
+        }
+    };
+
     // Create execution config
     let config = exec_strategy::ExecConfig {
         command: &command,
@@ -1348,10 +1514,13 @@ fn execute_sandboxed(
         caps: &caps,
         env_vars,
         cap_file: &cap_file_path,
+        current_dir: &current_dir,
         no_diagnostics: flags.no_diagnostics || flags.silent,
         threading,
         protected_paths: &flags.protected_paths,
         capability_elevation: flags.capability_elevation,
+        #[cfg(target_os = "linux")]
+        seccomp_proxy_fallback,
     };
 
     // Execute based on strategy
@@ -1373,8 +1542,9 @@ fn execute_sandboxed(
                     std::process::id()
                 );
 
-                let home = dirs::home_dir().ok_or(NonoError::HomeNotFound)?;
-                let session_dir = home.join(".nono").join("rollbacks").join(&session_id);
+                let session_dir =
+                    rollback_session::rollback_root_with_override(flags.rollback_dest.as_ref())?
+                        .join(&session_id);
                 std::fs::create_dir_all(&session_dir).map_err(|e| {
                     NonoError::Snapshot(format!(
                         "Failed to create session directory {}: {}",
@@ -1471,8 +1641,11 @@ fn execute_sandboxed(
                         // and print a one-line notice. This ensures zero-flag usage Just Works.
                         // Directories listed in --rollback-include are kept (not auto-excluded).
                         if !flags.rollback_all {
-                            let preflight_result =
-                                rollback_preflight::run_preflight(&tracked_paths, &exclusion);
+                            let preflight_result = rollback_preflight::run_preflight(
+                                &tracked_paths,
+                                &exclusion,
+                                &flags.skip_dirs,
+                            );
 
                             if preflight_result.needs_warning() {
                                 // Filter out any dirs the user explicitly wants to include
@@ -1538,13 +1711,7 @@ fn execute_sandboxed(
             };
 
             // --- Supervisor IPC setup (always active in Supervised mode) ---
-            let policy_data = policy::load_embedded_policy()?;
-            let mut never_grant = policy_data.never_grant;
             let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
-            never_grant.extend(protected_roots.as_strings()?);
-            never_grant.sort();
-            never_grant.dedup();
-            let never_grant_checker = nono::NeverGrantChecker::new(&never_grant)?;
             let approval_backend = terminal_approval::TerminalApproval;
             let supervisor_session_id = audit_state
                 .as_ref()
@@ -1556,12 +1723,24 @@ fn execute_sandboxed(
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
                     )
                 });
+            // Extract proxy port and bind ports for seccomp fallback config
+            #[cfg(target_os = "linux")]
+            let (sup_proxy_port, sup_proxy_bind_ports) = match caps.network_mode() {
+                nono::NetworkMode::ProxyOnly { port, bind_ports } => (*port, bind_ports.clone()),
+                _ => (0, Vec::new()),
+            };
+
             let supervisor_cfg = exec_strategy::SupervisorConfig {
-                never_grant: &never_grant_checker,
+                protected_roots: protected_roots.as_paths(),
                 approval_backend: &approval_backend,
                 session_id: &supervisor_session_id,
                 open_url_origins: &flags.open_url_origins,
                 open_url_allow_localhost: flags.open_url_allow_localhost,
+                allow_launch_services_active: flags.allow_launch_services_active,
+                #[cfg(target_os = "linux")]
+                proxy_port: sup_proxy_port,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: sup_proxy_bind_ports,
             };
 
             let trust_interceptor = if flags.trust_interception_active {
@@ -1662,9 +1841,6 @@ fn execute_sandboxed(
             }
 
             cleanup_capability_state_file(&cap_file_path);
-            if let Some(ref prompt_path) = prompt_file_path {
-                cleanup_capability_state_file(prompt_path);
-            }
             drop(config);
             drop(loaded_secrets);
             std::process::exit(exit_code);
@@ -1718,18 +1894,22 @@ struct PreparedSandbox {
     rollback_exclude_patterns: Vec<String>,
     /// Profile-specific rollback exclusion globs (filename matching)
     rollback_exclude_globs: Vec<String>,
+    /// Directory names to skip during trust scanning and rollback preflight.
+    skip_dirs: Vec<String>,
     /// Network profile name from profile config (if any)
     network_profile: Option<String>,
-    /// Additional proxy-allowed hosts from profile config
-    proxy_allow_hosts: Vec<String>,
+    /// Additional proxy-allowed domains from profile config
+    allow_domain: Vec<String>,
     /// Credential services from profile config
-    proxy_credentials: Vec<String>,
+    credentials: Vec<String>,
     /// Custom credential definitions from profile config
     custom_credentials: std::collections::HashMap<String, profile::CustomCredentialDef>,
-    /// External proxy address from profile config (if any)
-    external_proxy: Option<String>,
-    /// Bypass hosts for external proxy from profile config
-    external_proxy_bypass: Vec<String>,
+    /// Upstream proxy address from profile config (if any)
+    upstream_proxy: Option<String>,
+    /// Bypass hosts for upstream proxy from profile config
+    upstream_bypass: Vec<String>,
+    /// TCP ports the sandboxed child may listen on from profile config
+    listen_ports: Vec<u16>,
     /// Whether the profile enables runtime capability elevation (seccomp-notify + PTY)
     capability_elevation: bool,
     /// Whether direct LaunchServices opens are enabled for this session.
@@ -1738,6 +1918,8 @@ struct PreparedSandbox {
     open_url_origins: Vec<String>,
     /// Whether to allow http://localhost URL opens
     open_url_allow_localhost: bool,
+    /// Canonicalized paths exempted from deny groups via override_deny
+    override_deny_paths: Vec<std::path::PathBuf>,
 }
 
 fn parse_env_credential_map_args(values: &[String]) -> Result<Vec<(String, String)>> {
@@ -1845,11 +2027,6 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
     let loaded_profile = if let Some(ref profile_name) = args.profile {
         let prof = profile::load_profile(profile_name)?;
 
-        // Remove legacy nono section from CLAUDE.md (one-time migration).
-        // Earlier versions injected instructions directly into CLAUDE.md which
-        // persisted when Claude was run without nono. Now uses --append-system-prompt-file.
-        hooks::remove_legacy_claude_md_section();
-
         // Install hooks defined in the profile (idempotent - only installs if needed)
         if !prof.hooks.hooks.is_empty() {
             match hooks::install_profile_hooks(&prof.hooks.hooks) {
@@ -1898,6 +2075,46 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
+    // Collect override_deny paths from profile (canonicalized for query use)
+    let override_deny_paths: Vec<std::path::PathBuf> = loaded_profile
+        .as_ref()
+        .map(|prof| {
+            prof.policy
+                .override_deny
+                .iter()
+                .filter_map(|tmpl| {
+                    profile::expand_vars(tmpl, &workdir).ok().map(|expanded| {
+                        if expanded.exists() {
+                            expanded.canonicalize().unwrap_or(expanded)
+                        } else {
+                            expanded
+                        }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Also include CLI --override-deny paths.
+    // Apply the same ~ / $HOME expansion that apply_deny_overrides uses
+    // so the stored paths match the canonicalized form used by query_path.
+    let override_deny_paths: Vec<std::path::PathBuf> = {
+        let mut paths = override_deny_paths;
+        for p in &args.override_deny {
+            let path_str = p.to_string_lossy();
+            let expanded = profile::expand_vars(&path_str, &workdir).unwrap_or_else(|_| p.clone());
+            let canonical = if expanded.exists() {
+                expanded.canonicalize().unwrap_or(expanded)
+            } else {
+                expanded
+            };
+            if !paths.contains(&canonical) {
+                paths.push(canonical);
+            }
+        }
+        paths
+    };
+
     // Extract config before profile is consumed for secrets
     let capability_elevation = loaded_profile
         .as_ref()
@@ -1912,29 +2129,37 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         .as_ref()
         .map(|p| p.rollback.exclude_globs.clone())
         .unwrap_or_default();
+    let profile_skip_dirs = loaded_profile
+        .as_ref()
+        .map(|p| p.skipdirs.clone())
+        .unwrap_or_default();
     let profile_network_profile = loaded_profile.as_ref().and_then(|p| {
         p.network
             .resolved_network_profile()
             .map(|value| value.to_string())
     });
-    let profile_proxy_allow = loaded_profile
+    let profile_allow_domain = loaded_profile
         .as_ref()
-        .map(|p| p.network.proxy_allow.clone())
+        .map(|p| p.network.allow_domain.clone())
         .unwrap_or_default();
-    let profile_proxy_credentials = loaded_profile
+    let profile_credentials = loaded_profile
         .as_ref()
-        .map(|p| p.network.proxy_credentials.clone())
+        .map(|p| p.network.credentials.clone())
         .unwrap_or_default();
     let profile_custom_credentials = loaded_profile
         .as_ref()
         .map(|p| p.network.custom_credentials.clone())
         .unwrap_or_default();
-    let profile_external_proxy = loaded_profile
+    let profile_upstream_proxy = loaded_profile
         .as_ref()
-        .and_then(|p| p.network.external_proxy.clone());
-    let profile_external_proxy_bypass = loaded_profile
+        .and_then(|p| p.network.upstream_proxy.clone());
+    let profile_upstream_bypass = loaded_profile
         .as_ref()
-        .map(|p| p.network.external_proxy_bypass.clone())
+        .map(|p| p.network.upstream_bypass.clone())
+        .unwrap_or_default();
+    let profile_listen_ports = loaded_profile
+        .as_ref()
+        .map(|p| p.network.listen_port.clone())
         .unwrap_or_default();
     let open_url_origins = loaded_profile
         .as_ref()
@@ -2050,14 +2275,13 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
     // Final deny/allow overlap validation after ALL path grants are finalized,
     // including auto-included CWD. This closes the Linux Landlock blind spot
     // where deny-within-allow cannot be enforced.
-    let active_groups = if let Some(ref prof) = loaded_profile {
-        if prof.security.groups.is_empty() {
-            policy::base_groups()?
-        } else {
-            prof.security.groups.clone()
-        }
+    let active_groups = if let Some(prof) = loaded_profile
+        .as_ref()
+        .filter(|p| !p.security.groups.is_empty())
+    {
+        prof.security.groups.clone()
     } else {
-        policy::base_groups()?
+        crate::capability_ext::default_profile_groups()?
     };
     let loaded_policy = policy::load_embedded_policy()?;
     let deny_paths = policy::resolve_deny_paths_for_groups(&loaded_policy, &active_groups)?;
@@ -2136,7 +2360,7 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
                 };
                 eprintln!(
                     "  {}: env credential '{}' exposes the secret directly to the sandboxed process.\n\
-                     {}  For network API keys, use a profile with proxy_credentials for credential isolation.",
+                     {}  For network API keys, use a profile with credentials for credential isolation.",
                     "warning".yellow(),
                     display_account,
                     " ".repeat(11),
@@ -2167,16 +2391,19 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         secrets: loaded_secrets,
         rollback_exclude_patterns: profile_rollback_patterns,
         rollback_exclude_globs: profile_rollback_globs,
+        skip_dirs: profile_skip_dirs,
         network_profile: profile_network_profile,
-        proxy_allow_hosts: profile_proxy_allow,
-        proxy_credentials: profile_proxy_credentials,
+        allow_domain: profile_allow_domain,
+        credentials: profile_credentials,
         custom_credentials: profile_custom_credentials,
-        external_proxy: profile_external_proxy,
-        external_proxy_bypass: profile_external_proxy_bypass,
+        upstream_proxy: profile_upstream_proxy,
+        upstream_bypass: profile_upstream_bypass,
+        listen_ports: profile_listen_ports,
         capability_elevation,
         allow_launch_services_active,
         open_url_origins,
         open_url_allow_localhost,
+        override_deny_paths,
     })
 }
 
@@ -2271,87 +2498,14 @@ fn enforce_rollback_limits(silent: bool) {
     }
 }
 
-/// Check if the command being executed is Claude Code.
-///
-/// Matches the binary name "claude" regardless of path (e.g. /usr/bin/claude,
-/// ~/.npm/bin/claude, claude).
-fn is_claude_command(program: &OsString) -> bool {
-    std::path::Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| name == "claude")
-        .unwrap_or(false)
-}
-
-/// System prompt content injected into Claude Code sessions via --append-system-prompt-file.
-///
-/// This is ephemeral — it only exists for the duration of the nono session.
-/// Unlike CLAUDE.md injection, it leaves no persistent state to clean up.
-const NONO_SYSTEM_PROMPT: &str = "\
-You are running inside the nono security sandbox. This is a capability-based \
-sandbox that CANNOT be bypassed or modified from within the session.
-
-On ANY \"operation not permitted\" or \"EPERM\" error:
-
-IMMEDIATELY tell the user:
-> This path is not accessible in the current nono sandbox session. You need to \
-exit and restart with:
-> `nono run --allow /path/to/needed -- claude`
-
-NEVER attempt:
-- Alternative file paths or locations
-- Copying files to accessible directories
-- Using sudo or permission changes
-- Manual workarounds for the user to try
-- ANY other approach besides restarting nono
-
-The sandbox is a hard security boundary. Once applied, it cannot be expanded. \
-The ONLY solution is to restart the session with additional --allow flags.";
-
-/// Write the system prompt file for Claude Code.
-///
-/// Returns the path to the temp file, or None if writing failed.
-fn write_system_prompt_file(silent: bool) -> Option<std::path::PathBuf> {
-    use std::io::Write;
-
-    // SECURITY: Use tempfile crate to create file with O_EXCL and random name,
-    // preventing symlink attacks (CWE-377) on predictable paths in /tmp.
-    match tempfile::Builder::new()
-        .prefix(".nono-prompt-")
-        .suffix(".txt")
-        .tempfile()
-    {
-        Ok(mut file) => {
-            if let Err(e) = file.write_all(NONO_SYSTEM_PROMPT.as_bytes()) {
-                error!("Failed to write system prompt file: {}", e);
-                if !silent {
-                    eprintln!("  WARNING: System prompt file could not be written.");
-                }
-                return None;
-            }
-            // Persist the file so it outlives this scope (cleaned up manually after child exits)
-            match file.into_temp_path().keep() {
-                Ok(path) => Some(path),
-                Err(e) => {
-                    error!("Failed to persist system prompt file: {}", e);
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            error!("Failed to create system prompt file: {}", e);
-            if !silent {
-                eprintln!("  WARNING: System prompt file could not be written.");
-            }
-            None
-        }
-    }
-}
-
-fn write_capability_state_file(caps: &CapabilitySet, silent: bool) -> Option<std::path::PathBuf> {
+fn write_capability_state_file(
+    caps: &CapabilitySet,
+    override_deny_paths: &[std::path::PathBuf],
+    silent: bool,
+) -> Option<std::path::PathBuf> {
     // Write sandbox state for `nono why --self`.
     let cap_file = std::env::temp_dir().join(format!(".nono-{}.json", std::process::id()));
-    let state = sandbox_state::SandboxState::from_caps(caps);
+    let state = sandbox_state::SandboxState::from_caps(caps, override_deny_paths);
     if let Err(e) = state.write_to_file(&cap_file) {
         error!(
             "Failed to write capability state file: {}. \
@@ -2375,36 +2529,7 @@ mod tests {
     use super::*;
 
     fn sandbox_args() -> SandboxArgs {
-        SandboxArgs {
-            allow: vec![],
-            read: vec![],
-            write: vec![],
-            allow_file: vec![],
-            read_file: vec![],
-            write_file: vec![],
-            block_net: false,
-            allow_net: false,
-            network_profile: None,
-            allow_proxy: vec![],
-            proxy_credential: vec![],
-            external_proxy: None,
-            external_proxy_bypass: vec![],
-            override_deny: vec![],
-            allow_command: vec![],
-            block_command: vec![],
-            env_credential: None,
-            env_credential_map: vec![],
-            profile: None,
-            allow_cwd: false,
-            allow_launch_services: false,
-            workdir: None,
-            config: None,
-            verbose: 0,
-            dry_run: false,
-            allow_bind: vec![],
-            allow_port: vec![],
-            proxy_port: None,
-        }
+        SandboxArgs::default()
     }
 
     #[test]
@@ -2426,16 +2551,6 @@ mod tests {
 
     #[test]
     fn test_check_blocked_command_basic() {
-        assert!(config::check_blocked_command("rm", &[], &[])
-            .expect("policy must load")
-            .is_some());
-        assert!(config::check_blocked_command("dd", &[], &[])
-            .expect("policy must load")
-            .is_some());
-        assert!(config::check_blocked_command("chmod", &[], &[])
-            .expect("policy must load")
-            .is_some());
-
         assert!(config::check_blocked_command("echo", &[], &[])
             .expect("policy must load")
             .is_none());
@@ -2449,13 +2564,14 @@ mod tests {
 
     #[test]
     fn test_check_blocked_command_with_path() {
-        assert!(config::check_blocked_command("/bin/rm", &[], &[])
+        let blocked = vec!["rm".to_string(), "dd".to_string()];
+        assert!(config::check_blocked_command("/bin/rm", &[], &blocked)
             .expect("policy must load")
             .is_some());
-        assert!(config::check_blocked_command("/usr/bin/dd", &[], &[])
+        assert!(config::check_blocked_command("/usr/bin/dd", &[], &blocked)
             .expect("policy must load")
             .is_some());
-        assert!(config::check_blocked_command("./rm", &[], &[])
+        assert!(config::check_blocked_command("./rm", &[], &blocked)
             .expect("policy must load")
             .is_some());
     }
@@ -2463,10 +2579,11 @@ mod tests {
     #[test]
     fn test_check_blocked_command_allow_override() {
         let allowed = vec!["rm".to_string()];
-        assert!(config::check_blocked_command("rm", &allowed, &[])
+        let blocked = vec!["rm".to_string(), "dd".to_string()];
+        assert!(config::check_blocked_command("rm", &allowed, &blocked)
             .expect("policy must load")
             .is_none());
-        assert!(config::check_blocked_command("dd", &allowed, &[])
+        assert!(config::check_blocked_command("dd", &allowed, &blocked)
             .expect("policy must load")
             .is_some());
     }
@@ -2481,7 +2598,14 @@ mod tests {
         );
         assert!(config::check_blocked_command("rm", &[], &extra)
             .expect("policy must load")
-            .is_some());
+            .is_none());
+    }
+
+    #[test]
+    fn test_check_blocked_command_uses_resolved_policy_only() {
+        assert!(config::check_blocked_command("rm", &[], &[])
+            .expect("policy must load")
+            .is_none());
     }
 
     #[test]
@@ -2495,16 +2619,19 @@ mod tests {
             secrets: Vec::new(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            skip_dirs: Vec::new(),
             network_profile: Some("developer".to_string()),
-            proxy_allow_hosts: vec!["docs.python.org".to_string()],
-            proxy_credentials: vec!["github".to_string()],
+            allow_domain: vec!["docs.python.org".to_string()],
+            credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
-            external_proxy: None,
-            external_proxy_bypass: Vec::new(),
+            upstream_proxy: None,
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
             capability_elevation: false,
             allow_launch_services_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
+            override_deny_paths: Vec::new(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -2513,8 +2640,8 @@ mod tests {
             effective,
             EffectiveProxySettings {
                 network_profile: None,
-                proxy_allow_hosts: Vec::new(),
-                proxy_credentials: Vec::new(),
+                allow_domain: Vec::new(),
+                credentials: Vec::new(),
             }
         );
     }
@@ -2532,16 +2659,19 @@ mod tests {
             secrets: Vec::new(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
+            skip_dirs: Vec::new(),
             network_profile: Some("developer".to_string()),
-            proxy_allow_hosts: vec!["docs.python.org".to_string()],
-            proxy_credentials: vec!["github".to_string()],
+            allow_domain: vec!["docs.python.org".to_string()],
+            credentials: vec!["github".to_string()],
             custom_credentials: std::collections::HashMap::new(),
-            external_proxy: None,
-            external_proxy_bypass: Vec::new(),
+            upstream_proxy: None,
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
             capability_elevation: false,
             allow_launch_services_active: false,
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
+            override_deny_paths: Vec::new(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -2550,8 +2680,8 @@ mod tests {
             effective,
             EffectiveProxySettings {
                 network_profile: Some("minimal".to_string()),
-                proxy_allow_hosts: vec!["docs.python.org".to_string(), "example.com".to_string()],
-                proxy_credentials: vec!["github".to_string(), "openai".to_string()],
+                allow_domain: vec!["docs.python.org".to_string(), "example.com".to_string()],
+                credentials: vec!["github".to_string(), "openai".to_string()],
             }
         );
     }
@@ -2564,9 +2694,9 @@ mod tests {
     }
 
     #[test]
-    fn test_trust_interception_active_when_instruction_patterns_exist() {
+    fn test_trust_interception_active_when_includes_exist() {
         let policy = nono::trust::TrustPolicy {
-            instruction_patterns: vec!["SKILLS.md".to_string()],
+            includes: vec!["SKILLS.md".to_string()],
             ..nono::trust::TrustPolicy::default()
         };
 
@@ -2614,27 +2744,25 @@ mod tests {
     }
 
     #[test]
-    fn test_is_claude_command_bare_name() {
-        assert!(is_claude_command(&OsString::from("claude")));
+    fn test_execution_start_dir_keeps_workdir_when_covered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = dir.path().canonicalize().expect("canonicalize");
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_dir(dir.path(), AccessMode::Read).expect("grant"));
+
+        let start_dir = execution_start_dir(dir.path(), &caps).expect("start dir");
+
+        assert_eq!(start_dir, canonical);
     }
 
     #[test]
-    fn test_is_claude_command_absolute_path() {
-        assert!(is_claude_command(&OsString::from("/usr/local/bin/claude")));
-    }
+    fn test_execution_start_dir_falls_back_to_root_when_not_covered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let caps = CapabilitySet::new();
 
-    #[test]
-    fn test_is_claude_command_home_path() {
-        assert!(is_claude_command(&OsString::from(
-            "/home/user/.npm/bin/claude"
-        )));
-    }
+        let start_dir = execution_start_dir(dir.path(), &caps).expect("start dir");
 
-    #[test]
-    fn test_is_claude_command_not_claude() {
-        assert!(!is_claude_command(&OsString::from("bash")));
-        assert!(!is_claude_command(&OsString::from("/usr/bin/python3")));
-        assert!(!is_claude_command(&OsString::from("claude-code")));
+        assert_eq!(start_dir, std::path::PathBuf::from("/"));
     }
 
     #[cfg(target_os = "macos")]

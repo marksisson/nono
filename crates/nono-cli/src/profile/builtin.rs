@@ -34,6 +34,15 @@ mod tests {
     }
 
     #[test]
+    fn test_get_builtin_default() {
+        let profile = get_builtin("default").expect("Profile not found");
+        assert_eq!(profile.meta.name, "default");
+        assert_eq!(profile.workdir.access, WorkdirAccess::None);
+        assert!(!profile.interactive);
+        assert!(!profile.network.block);
+    }
+
+    #[test]
     fn test_get_builtin_claude_code_uses_platform_groups_for_os_paths() {
         let profile = get_builtin("claude-code").expect("Profile not found");
         assert!(profile
@@ -112,6 +121,10 @@ mod tests {
         assert!(profile
             .filesystem
             .allow
+            .contains(&"$HOME/.opencode".to_string()));
+        assert!(profile
+            .filesystem
+            .allow
             .contains(&"$HOME/.local/share/opentui".to_string()));
     }
 
@@ -144,6 +157,7 @@ mod tests {
     #[test]
     fn test_list_builtin() {
         let profiles = list_builtin();
+        assert!(profiles.contains(&"default".to_string()));
         assert!(profiles.contains(&"claude-code".to_string()));
         assert!(profiles.contains(&"codex".to_string()));
         assert!(profiles.contains(&"openclaw".to_string()));
@@ -152,17 +166,9 @@ mod tests {
     }
 
     #[test]
-    fn test_base_groups_from_policy() {
-        let groups = crate::policy::base_groups().expect("load base groups");
-        assert!(!groups.is_empty());
-        assert!(groups.contains(&"deny_credentials".to_string()));
-        assert!(groups.contains(&"system_read_macos".to_string()));
-    }
-
-    #[test]
     fn test_profile_group_merging() {
         let profile = get_builtin("claude-code").expect("Profile not found");
-        // Should have base groups
+        // Should have default profile groups
         assert!(profile
             .security
             .groups
@@ -183,18 +189,61 @@ mod tests {
     }
 
     #[test]
-    fn test_trust_groups_exclusion() {
-        // Verify that trust_groups mechanism works by checking openclaw
-        // doesn't have groups it shouldn't (trust_groups is empty for all
-        // current profiles, but the merging path is exercised)
+    fn test_profile_exclusion_mechanism() {
+        // Verify that built-in profiles resolve exclusions through the shared
+        // group-exclusion path. Current embedded profiles do not exclude any.
         let profile = get_builtin("openclaw").expect("Profile not found");
-        let base = crate::policy::base_groups().expect("load base groups");
-        // All base groups should be present since trust_groups is empty
-        for group in &base {
+        let default = get_builtin("default").expect("default profile");
+        // All default groups should be present since embedded exclusions are empty.
+        for group in &default.security.groups {
             assert!(
                 profile.security.groups.contains(group),
-                "openclaw should contain base group '{}'",
+                "openclaw should contain default profile group '{}'",
                 group
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_profile_group_set_is_explicit() {
+        let profile = get_builtin("default").expect("default profile");
+        let mut expected = vec![
+            "dangerous_commands".to_string(),
+            "dangerous_commands_linux".to_string(),
+            "dangerous_commands_macos".to_string(),
+            "deny_browser_data_linux".to_string(),
+            "deny_browser_data_macos".to_string(),
+            "deny_credentials".to_string(),
+            "deny_keychains_linux".to_string(),
+            "deny_keychains_macos".to_string(),
+            "deny_macos_private".to_string(),
+            "deny_shell_configs".to_string(),
+            "deny_shell_history".to_string(),
+            "homebrew".to_string(),
+            "system_read_linux".to_string(),
+            "system_read_macos".to_string(),
+            "system_write_linux".to_string(),
+            "system_write_macos".to_string(),
+            "user_tools".to_string(),
+        ];
+        let mut actual = profile.security.groups.clone();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_embedded_profiles_extend_default() {
+        let policy = crate::policy::load_embedded_policy().expect("load embedded policy");
+        for (name, def) in &policy.profiles {
+            if name == "default" {
+                continue;
+            }
+            assert_eq!(
+                def.extends.as_deref(),
+                Some("default"),
+                "embedded profile '{}' should extend default",
+                name
             );
         }
     }

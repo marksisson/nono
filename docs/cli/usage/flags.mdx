@@ -78,7 +78,7 @@ nono wrap [OPTIONS] -- <COMMAND> [ARGS...]
 ```
 
 <Note>
-  `nono wrap` does not support proxy flags (`--network-profile`, `--allow-proxy`, `--proxy-credential`, `--external-proxy`, `--external-proxy-bypass`). The network proxy requires a parent process. Use `nono run` instead.
+  `nono wrap` does not support proxy flags (`--network-profile`, `--allow-domain`, `--credential`, `--upstream-proxy`, `--upstream-bypass`). The network proxy requires a parent process. Use `nono run` instead.
 </Note>
 
 ### `nono why`
@@ -93,7 +93,7 @@ nono why --self --path <PATH> --op <OP> [OPTIONS]  # Inside sandbox
 
 ### `nono learn`
 
-Trace a command to discover required filesystem paths. Uses strace to monitor file accesses and outputs paths that would need to be allowed in a nono profile. (Linux only)
+Trace a command to discover required filesystem paths and network activity. Uses `strace` on Linux and `fs_usage` + `nettop` on macOS to monitor accesses and outputs paths and connections that would need to be allowed in a nono profile.
 
 ```bash
 nono learn [OPTIONS] -- <COMMAND> [ARGS...]
@@ -107,26 +107,44 @@ Set up nono on this system. Verifies installation, tests sandbox support, and op
 nono setup [OPTIONS]
 ```
 
+### `nono policy`
+
+Inspect policy groups, profiles, and security rules.
+
+```bash
+nono policy <SUBCOMMAND>
+```
+
+Subcommands:
+- `groups` - List policy groups or show details for a specific group
+- `profiles` - List all available profiles (built-in and user)
+- `show` - Show a fully resolved profile
+- `diff` - Diff two profiles
+- `validate` - Validate a profile JSON file
+
+See [Policy Introspection](/cli/features/policy-introspection) for full documentation.
+
 ### `nono trust`
 
-Manage instruction file attestation. Sign, verify, and manage trust for AI agent instruction files.
+Manage file attestation. Sign, verify, and manage trust for files consumed by AI agents.
 
 ```bash
 nono trust <SUBCOMMAND>
 ```
 
 Subcommands:
-- `sign` - Sign instruction files
+- `init` - Create a trust-policy.json in the current directory
+- `sign` - Sign files
 - `sign-policy` - Sign a trust policy file
-- `verify` - Verify instruction files against the trust policy
-- `list` - List instruction files and their verification status
+- `verify` - Verify files against the trust policy
+- `list` - List files and their verification status
 - `keygen` - Generate a new signing key pair
 - `export-key` - Export the public key for a signing key
 
 ## `nono learn` Options
 
 <Note>
-  `nono learn` is only available on Linux as it requires strace. The command runs WITHOUT sandbox restrictions to discover what paths your application needs.
+  `nono learn` runs WITHOUT sandbox restrictions to discover what paths and network connections your application needs. On Linux it uses `strace` (install with `apt install strace`). On macOS it uses `fs_usage` and `nettop` for filesystem and network discovery (requires `sudo`).
 </Note>
 
 ### `--profile`, `-p`
@@ -248,19 +266,6 @@ Block all network access. Network is **allowed by default**.
 nono run --allow . --block-net -- cargo build
 ```
 
-#### `--allow-net`
-
-Force unrestricted outbound network access for this session. This is mainly useful when a selected profile would otherwise enable proxy filtering.
-
-```bash
-# Keep the claude-code profile, but bypass its proxy filtering for one run
-nono run --profile claude-code --allow-net -- claude
-```
-
-<Note>
-  `--allow-net` disables proxy mode for that run, so it also disables proxy-based credential injection. It conflicts with `--block-net`, `--network-profile`, `--allow-proxy`, `--proxy-credential`, `--external-proxy`, `--external-proxy-bypass`, and `--proxy-port`.
-</Note>
-
 #### `--network-profile`
 
 Use a predefined network profile for host-level filtering. When set, outbound traffic is routed through a localhost proxy that only allows connections to hosts in the profile.
@@ -273,35 +278,35 @@ nono run --allow-cwd --network-profile claude-code -- claude
 nono run --allow-cwd --network-profile minimal -- my-agent
 ```
 
-Available profiles: `claude-code`, `developer`, `minimal`, `opencode`, `enterprise`. See [Network Proxy](/cli/features/network-proxy) for details.
+Available profiles: `minimal`, `developer`, `claude-code`, `codex`, `opencode`, `enterprise`. See [Networking](/cli/features/networking) for details.
 
 <Note>
-  `--network-profile` and `--allow-proxy` activate proxy mode, which forces supervised execution. The proxy runs in the unsandboxed parent process.
+  `--network-profile` and `--allow-domain` activate proxy mode, which forces supervised execution. The proxy runs in the unsandboxed parent process.
 </Note>
 
-#### `--allow-proxy`
+#### `--allow-domain`
 
-Allow a specific host through the network proxy. Can be specified multiple times. Activates proxy mode if not already active.
+Add a domain to the proxy allowlist. Can be specified multiple times. Activates proxy mode if not already active.
 
 ```bash
-# Allow specific hosts
-nono run --allow-cwd --allow-proxy api.openai.com --allow-proxy api.anthropic.com -- my-agent
+# Allow specific domains
+nono run --allow-cwd --allow-domain api.openai.com --allow-domain api.anthropic.com -- my-agent
 
-# Combine with a network profile for additional hosts
-nono run --allow-cwd --network-profile minimal --allow-proxy custom-api.example.com -- my-agent
+# Combine with a network profile for additional domains
+nono run --allow-cwd --network-profile minimal --allow-domain custom-api.example.com -- my-agent
 ```
 
-#### `--proxy-credential`
+#### `--credential`
 
 Enable credential injection for a named service via the reverse proxy. The service must be either a built-in service (`openai`, `anthropic`, `gemini`, `google-ai`) or defined as a custom credential in your profile. Credentials are loaded from the system keyring under the `nono` service name, from 1Password when `credential_key` is an `op://` URI, or from Apple Passwords on macOS when `credential_key` is an `apple-password://` URI.
 
 ```bash
 # Inject OpenAI credentials (loads from keyring account "openai_api_key")
-nono run --allow-cwd --network-profile claude-code --proxy-credential openai -- my-agent
+nono run --allow-cwd --network-profile claude-code --credential openai -- my-agent
 
 # Multiple credentials
 nono run --allow-cwd --network-profile claude-code \
-  --proxy-credential openai --proxy-credential anthropic -- my-agent
+  --credential openai --credential anthropic -- my-agent
 ```
 
 The proxy sets `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, etc. in the child environment so SDKs route through the proxy automatically.
@@ -323,35 +328,35 @@ Custom credentials can be defined in profiles for APIs not covered by the built-
 
 See [Credential Injection](/cli/features/credential-injection) for complete documentation including custom credential definitions.
 
-#### `--external-proxy`
+#### `--upstream-proxy`
 
-Chain outbound connections through an external (enterprise) proxy. Cloud metadata endpoints are still denied.
+Chain outbound connections through an upstream (enterprise) proxy. Cloud metadata endpoints are still denied.
 
 ```bash
-nono run --allow-cwd --network-profile enterprise --external-proxy squid.corp:3128 -- my-agent
+nono run --allow-cwd --network-profile enterprise --upstream-proxy squid.corp:3128 -- my-agent
 ```
 
-#### `--external-proxy-bypass`
+#### `--upstream-bypass`
 
-Route specific domains directly instead of through the external proxy. Supports exact hostnames and `*.` wildcard suffixes (case-insensitive). Requires `--external-proxy`.
+Route specific domains directly instead of through the upstream proxy. Supports exact hostnames and `*.` wildcard suffixes (case-insensitive). Requires `--upstream-proxy`.
 
 ```bash
-# Bypass the enterprise proxy for internal services
+# Bypass the upstream proxy for internal services
 nono run --allow-cwd --network-profile enterprise \
-  --external-proxy squid.corp:3128 \
-  --external-proxy-bypass internal.corp \
-  --external-proxy-bypass "*.private.net" \
+  --upstream-proxy squid.corp:3128 \
+  --upstream-bypass internal.corp \
+  --upstream-bypass "*.private.net" \
   -- my-agent
 
 # Multiple bypass patterns
 nono run --allow-cwd \
-  --external-proxy squid.corp:3128 \
-  --external-proxy-bypass git.internal.corp \
-  --external-proxy-bypass "*.dev.local" \
+  --upstream-proxy squid.corp:3128 \
+  --upstream-bypass git.internal.corp \
+  --upstream-bypass "*.dev.local" \
   -- my-agent
 ```
 
-Bypass hosts are checked before routing. Matching hosts use a direct CONNECT tunnel (same as Mode 1); non-matching hosts chain through the external proxy.
+Bypass hosts are checked before routing. Matching hosts use a direct CONNECT tunnel; non-matching hosts chain through the upstream proxy.
 
 Can be specified multiple times.
 
@@ -361,7 +366,7 @@ Set a fixed port for the credential injection proxy (default: OS-assigned epheme
 
 ```bash
 # Use a fixed proxy port for applications that need base URL configuration
-nono run --profile openclaw --proxy-port 19999 --allow-bind 18789 -- openclaw gateway
+nono run --profile openclaw --proxy-port 19999 --listen-port 18789 -- openclaw gateway
 
 # The credential proxy will always be at http://127.0.0.1:19999
 # Configure the application to use this base URL for API calls
@@ -371,21 +376,21 @@ nono run --profile openclaw --proxy-port 19999 --allow-bind 18789 -- openclaw ga
 Without `--proxy-port`, nono uses an OS-assigned ephemeral port and sets environment variables like `GEMINI_BASE_URL=http://127.0.0.1:PORT/gemini`. Applications that read these env vars don't need `--proxy-port`. Use it only when the application requires manual base URL configuration.
 </Note>
 
-#### `--allow-bind`
+#### `--listen-port`
 
-Allow the sandboxed process to bind and listen on a TCP port. Required when running server applications (like AI gateways) in proxy mode.
+Allow the sandboxed process to listen on a TCP port. Required when running server applications (like AI gateways) in proxy mode.
 
 ```bash
 # Allow OpenClaw gateway to listen on its default port
-nono run --profile openclaw --allow-bind 18789 \
-  --proxy-credential openai -- openclaw gateway
+nono run --profile openclaw --listen-port 18789 \
+  --credential openai -- openclaw gateway
 
 # Allow a development server
-nono run --allow-cwd --network-profile developer --allow-bind 3000 -- npm run dev
+nono run --allow-cwd --network-profile developer --listen-port 3000 -- npm run dev
 ```
 
 <Warning>
-**macOS limitation:** Seatbelt cannot filter by port number. When `--allow-bind` is specified on macOS, the sandbox permits binding to **any** port and accepting inbound connections from any source.
+**macOS limitation:** Seatbelt cannot filter by port number. When `--listen-port` is specified on macOS, the sandbox permits binding to **any** port and accepting inbound connections from any source.
 
 This is a broader permission than intended, but the security impact is limited:
 - Outbound connections are still restricted to allowed hosts via the proxy
@@ -397,23 +402,23 @@ On Linux with Landlock ABI v4+, per-port filtering is enforced and only the spec
 </Warning>
 
 <Note>
-`--allow-bind` only has effect in proxy mode (when `--network-profile` or `--allow-proxy` is active). Without proxy mode, network operations use the default OS-level allow/deny and bind is not restricted.
+`--listen-port` only has effect in proxy mode (when `--network-profile` or `--allow-domain` is active). Without proxy mode, network operations use the default OS-level allow/deny and bind is not restricted.
 </Note>
 
-#### `--allow-port`
+#### `--open-port`
 
 Allow bidirectional localhost TCP on a specific port. The sandboxed process can both **connect to** and **bind/listen on** `127.0.0.1:<PORT>`. Use this for IPC between sandboxed processes (e.g., MCP servers, dev tools, AI agents running in separate sandboxes).
 
 ```bash
 # MCP server in one sandbox, client in another — both can use port 3000
-nono run --block-net --allow-port 3000 --allow ./mcp-server -- node server.js
-nono run --block-net --allow-port 3000 --allow ./client -- claude
+nono run --block-net --open-port 3000 --allow ./mcp-server -- node server.js
+nono run --block-net --open-port 3000 --allow ./client -- claude
 
 # Multiple IPC ports
-nono run --block-net --allow-port 3000 --allow-port 5000 --allow-cwd -- my-agent
+nono run --block-net --open-port 3000 --open-port 5000 --allow-cwd -- my-agent
 
 # Combine with proxy mode — outbound filtered + localhost IPC on port 4000
-nono run --network-profile claude-code --allow-port 4000 --allow-cwd -- claude
+nono run --network-profile claude-code --open-port 4000 --allow-cwd -- claude
 ```
 
 Works across all network modes:
@@ -424,14 +429,14 @@ Works across all network modes:
 Can be specified multiple times for multiple ports.
 
 <Warning>
-**macOS limitation:** Seatbelt cannot filter bind/inbound by port number. When `--allow-port` is specified on macOS, the sandbox permits binding to **any** port (same tradeoff as `--allow-bind`). Outbound connections are still restricted to only the specified localhost ports.
+**macOS limitation:** Seatbelt cannot filter bind/inbound by port number. When `--open-port` is specified on macOS, the sandbox permits binding to **any** port (same tradeoff as `--listen-port`). Outbound connections are still restricted to only the specified localhost ports.
 
-**Linux limitation:** Landlock ABI v4+ enforces both connect and bind per-port, but **cannot filter by destination IP**. The ConnectTcp rule allows connecting to the specified port on any IP, not just localhost. In practice this is mitigated by using `--block-net` (which blocks all outbound except the allowed ports) or proxy mode (which routes outbound through the localhost proxy). Only the `--allow-port` + default AllowAll combination (a no-op) would theoretically permit non-localhost connections on the port.
+**Linux limitation:** Landlock ABI v4+ enforces both connect and bind per-port, but **cannot filter by destination IP**. The ConnectTcp rule allows connecting to the specified port on any IP, not just localhost. In practice this is mitigated by using `--block-net` (which blocks all outbound except the allowed ports) or proxy mode (which routes outbound through the localhost proxy). Only the `--open-port` + default AllowAll combination (a no-op) would theoretically permit non-localhost connections on the port.
 </Warning>
 
 ## `nono shell` Options
 
-`nono shell` supports the same permission, profile, secrets, and dry-run flags as `nono run`, plus:
+`nono shell` supports the same permission, profile, credential, and dry-run flags as `nono run`, plus:
 
 ### `--shell`
 
@@ -515,7 +520,6 @@ Can be specified multiple times.
 <Warning>
 **Security guardrails:**
 
-- Paths in the `never_grant` list (SSH private keys, `/etc/shadow`, etc.) cannot be overridden. Attempting to override a `never_grant` path — or any ancestor that would expose one — is a hard error.
 - A warning is printed to stderr for each override applied, making security relaxations visible in logs.
 - On macOS, Seatbelt allow rules more specific than the deny are emitted. On Linux, the deny path is removed from validation so Landlock allow rules take effect.
 </Warning>
@@ -568,7 +572,7 @@ Credentials are:
 - `--env-credential` URI suffix form remains supported for 1Password compatibility (`op://...=VAR`)
 - Zeroized from memory after `exec()`
 
-For network API keys, prefer `--proxy-credential` instead for credential isolation — the agent never sees the real API key.
+For network API keys, prefer `--credential` instead for credential isolation — the agent never sees the real API key.
 
 See [Credential Injection](/cli/features/credential-injection) for full documentation on storing and using credentials.
 
@@ -694,6 +698,22 @@ Include ALL directories in rollback snapshots, overriding all auto-exclusions. T
 nono run --rollback --rollback-all -- cargo test
 ```
 
+#### `--skip-dir`
+
+Skip a directory name during pre-exec trust scanning and rollback preflight. Repeatable. Matches exact path components, not full paths. This is useful for large generated trees that are safe to exclude in your workflow.
+
+```bash
+# Skip a generated docs tree for this run
+nono run --skip-dir docs-build --allow-cwd -- my-agent
+
+# Skip multiple large trees
+nono run --skip-dir vendor-cache --skip-dir generated --allow-cwd -- my-agent
+```
+
+<Note>
+  `--skip-dir` does not change sandbox permissions. It only prunes trust discovery and rollback preflight traversal. Hidden directories are still scanned unless they are in the built-in heavy-dir list or explicitly named here.
+</Note>
+
 #### `--no-diagnostics`
 
 Suppress the diagnostic footer when the command exits non-zero. Useful for scripts that parse stderr and need stable output.
@@ -776,6 +796,14 @@ nono run --config ./nono.toml -- command
 <Note>
   Configuration file support is planned for a future release.
 </Note>
+
+#### `--help`, `-h`
+
+Print help information for the command.
+
+```bash
+nono run --help
+```
 
 ## `nono why` Options
 
@@ -860,9 +888,31 @@ Available context flags:
 
 ## `nono trust` Options
 
+### `nono trust init`
+
+Create a `trust-policy.json` in the current directory. Scans for files and auto-populates patterns and publisher.
+
+```bash
+nono trust init                            # Scan root directory only
+nono trust init -r                         # Scan recursively
+nono trust init -r --exclude-dirs tmp logs # Exclude extra directories
+nono trust init --key my-key --force       # Specific key, overwrite existing
+```
+
+| Option | Description |
+|--------|-------------|
+| `-r`, `--recursive` | Scan subdirectories recursively |
+| `--exclude-dirs <DIR...>` | Additional directories to exclude (on top of `.gitignore` and built-in list) |
+| `--key <KEY_ID>` | Key ID to include as publisher (default: "default") |
+| `--force` | Overwrite existing `trust-policy.json` |
+
+<Note>
+  File discovery for `init` respects `.gitignore` to keep the generated policy clean. Hidden directories like `.claude/` and `.github/` are included. Common build artifact directories (`node_modules`, `target`, `.venv`, etc.) are skipped by default. Note: the pre-exec trust scan and `sign --all`/`verify --all` do **not** respect `.gitignore` — adding a file to `.gitignore` cannot bypass trust verification.
+</Note>
+
 ### `nono trust sign`
 
-Sign instruction files, producing bundles for verification.
+Sign files, producing bundles for verification.
 
 ```bash
 nono trust sign <FILES...>                 # Sign specific files
@@ -887,9 +937,15 @@ Sign a trust policy file.
 
 ```bash
 nono trust sign-policy                     # Sign trust-policy.json in CWD
+nono trust sign-policy --user              # Sign user-level trust policy (~/.config/nono/)
 nono trust sign-policy path/to/policy.json # Sign specific file
 nono trust sign-policy --key my-key        # Use a specific key
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--user` | Sign the user-level trust policy at `~/.config/nono/trust-policy.json`. The user-level policy anchors trust — without it, project-level policies are not authoritative |
+| `--key <KEY_ID>` | Key ID from system keystore (default: "default") |
 
 ### `nono trust verify`
 
@@ -1011,13 +1067,14 @@ CLI flags always take precedence over environment variables.
 |------|---------------------|---------|
 | `--allow` | `NONO_ALLOW` | `NONO_ALLOW=/tmp/a,/tmp/b` (comma-separated) |
 | `--block-net` | `NONO_BLOCK_NET` | `NONO_BLOCK_NET=true` |
-| `--allow-net` | `NONO_ALLOW_NET` | `NONO_ALLOW_NET=true` |
 | `--profile` | `NONO_PROFILE` | `NONO_PROFILE=developer` |
 | `--network-profile` | `NONO_NETWORK_PROFILE` | `NONO_NETWORK_PROFILE=claude-code` |
+| `--allow-domain` | `NONO_ALLOW_DOMAIN` | `NONO_ALLOW_DOMAIN=api.openai.com` |
+| `--credential` | `NONO_CREDENTIAL` | `NONO_CREDENTIAL=openai` |
 | `--env-credential` | `NONO_ENV_CREDENTIAL` | `NONO_ENV_CREDENTIAL=key1,key2` |
 | `--capability-elevation` | `NONO_CAPABILITY_ELEVATION` | `NONO_CAPABILITY_ELEVATION=true` |
-| `--external-proxy` | `NONO_EXTERNAL_PROXY` | `NONO_EXTERNAL_PROXY=squid.corp:3128` |
-| `--external-proxy-bypass` | `NONO_EXTERNAL_PROXY_BYPASS` | `NONO_EXTERNAL_PROXY_BYPASS=internal.corp,*.private.net` (comma-separated) |
+| `--upstream-proxy` | `NONO_UPSTREAM_PROXY` | `NONO_UPSTREAM_PROXY=squid.corp:3128` |
+| `--upstream-bypass` | `NONO_UPSTREAM_BYPASS` | `NONO_UPSTREAM_BYPASS=internal.corp,*.private.net` (comma-separated) |
 
 Boolean variables accept `true`, `false`, `yes`, `no`, `1`, `0`.
 

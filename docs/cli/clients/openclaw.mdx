@@ -350,23 +350,23 @@ Edit `~/.openclaw/agents/main/agent/auth-profiles.json` and ensure each profile 
 ```bash
 # For Google Gemini
 nono run --profile openclaw --allow-cwd \
-  --proxy-credential gemini --proxy-port 19999 \
-  --allow-bind 18789 -- openclaw gateway
+  --credential gemini --proxy-port 19999 \
+  --listen-port 18789 -- openclaw gateway
 
 # For OpenAI
 nono run --profile openclaw --allow-cwd \
-  --proxy-credential openai --proxy-port 19999 \
-  --allow-bind 18789 -- openclaw gateway
+  --credential openai --proxy-port 19999 \
+  --listen-port 18789 -- openclaw gateway
 
 # For Anthropic
 nono run --profile openclaw --allow-cwd \
-  --proxy-credential anthropic --proxy-port 19999 \
-  --allow-bind 18789 -- openclaw gateway
+  --credential anthropic --proxy-port 19999 \
+  --listen-port 18789 -- openclaw gateway
 
 # Multiple providers
 nono run --profile openclaw --allow-cwd \
-  --proxy-credential gemini --proxy-credential openai --proxy-credential anthropic \
-  --proxy-port 19999 --allow-bind 18789 -- openclaw gateway
+  --credential gemini --credential openai --credential anthropic \
+  --proxy-port 19999 --listen-port 18789 -- openclaw gateway
 ```
 
 **How it works:**
@@ -382,15 +382,15 @@ See [Credential Injection](/cli/features/credential-injection) for setup instruc
 
 ### Server Apps and Port Binding
 
-OpenClaw Gateway listens on a WebSocket port (default 18789) to accept connections from UI clients and nodes. In proxy mode, you must explicitly allow this with `--allow-bind`:
+OpenClaw Gateway listens on a WebSocket port (default 18789) to accept connections from UI clients and nodes. In proxy mode, you must explicitly allow this with `--listen-port`:
 
 ```bash
-nono run --profile openclaw --allow-bind 18789 \
-  --proxy-credential openai -- openclaw gateway
+nono run --profile openclaw --listen-port 18789 \
+  --credential openai -- openclaw gateway
 ```
 
 <Warning>
-**macOS limitation:** Seatbelt cannot filter by port number. When `--allow-bind` is specified on macOS, the sandbox permits binding to any port and accepting inbound connections from any source.
+**macOS limitation:** Seatbelt cannot filter by port number. When `--listen-port` is specified on macOS, the sandbox permits binding to any port and accepting inbound connections from any source.
 
 This is a broader permission than intended, but the security impact is limited:
 - Outbound connections are still restricted to the proxy (credential exfiltration is blocked)

@@ -80,12 +80,15 @@ impl PreflightResult {
 /// Phase 1 checks immediate children for known heavy directory names that are
 /// not already excluded. If none are found, returns early with an empty result.
 /// Phase 2 performs a bounded walk to estimate total file count.
+///
+/// `extra_skip_dirs` are user-supplied names treated like built-in heavy dirs.
 pub(crate) fn run_preflight(
     tracked_paths: &[PathBuf],
     exclusion: &ExclusionFilter,
+    extra_skip_dirs: &[String],
 ) -> PreflightResult {
     // Phase 1: sentinel check
-    let heavy_dirs = detect_heavy_dirs(tracked_paths, exclusion);
+    let heavy_dirs = detect_heavy_dirs(tracked_paths, exclusion, extra_skip_dirs);
 
     if heavy_dirs.is_empty() {
         return PreflightResult {
@@ -133,7 +136,11 @@ pub(crate) fn run_preflight(
 
 /// Phase 1: check immediate children of tracked dirs for known heavy names
 /// and size-based detection of unknown large directories.
-fn detect_heavy_dirs(tracked_paths: &[PathBuf], exclusion: &ExclusionFilter) -> Vec<HeavyDir> {
+fn detect_heavy_dirs(
+    tracked_paths: &[PathBuf],
+    exclusion: &ExclusionFilter,
+    extra_skip_dirs: &[String],
+) -> Vec<HeavyDir> {
     let mut found = Vec::new();
     let mut size_check_candidates = Vec::new();
 
@@ -172,6 +179,12 @@ fn detect_heavy_dirs(tracked_paths: &[PathBuf], exclusion: &ExclusionFilter) -> 
                     path,
                     name: name_str,
                     description: (*description).to_string(),
+                });
+            } else if extra_skip_dirs.iter().any(|dir| dir == &name_str) {
+                found.push(HeavyDir {
+                    path,
+                    name: name_str,
+                    description: "user-defined skip directory".to_string(),
                 });
             } else {
                 // Not a known name — candidate for size-based check
@@ -337,7 +350,7 @@ mod tests {
         std::fs::create_dir_all(tracked.join("src")).expect("create src");
 
         let filter = make_filter(vec![]);
-        let heavy = detect_heavy_dirs(&[tracked], &filter);
+        let heavy = detect_heavy_dirs(&[tracked], &filter, &[]);
 
         let names: Vec<&str> = heavy.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"target"), "Should detect target/");
@@ -357,7 +370,7 @@ mod tests {
 
         // Pre-exclude target
         let filter = make_filter(vec!["target"]);
-        let heavy = detect_heavy_dirs(&[tracked], &filter);
+        let heavy = detect_heavy_dirs(&[tracked], &filter, &[]);
 
         let names: Vec<&str> = heavy.iter().map(|d| d.name.as_str()).collect();
         assert!(
@@ -377,7 +390,7 @@ mod tests {
         std::fs::create_dir_all(&tracked).expect("create empty dir");
 
         let filter = make_filter(vec![]);
-        let result = run_preflight(&[tracked], &filter);
+        let result = run_preflight(&[tracked], &filter, &[]);
 
         assert!(!result.needs_warning());
     }
@@ -385,7 +398,7 @@ mod tests {
     #[test]
     fn preflight_nonexistent_path_no_warning() {
         let filter = make_filter(vec![]);
-        let result = run_preflight(&[PathBuf::from("/nonexistent/path/xyz")], &filter);
+        let result = run_preflight(&[PathBuf::from("/nonexistent/path/xyz")], &filter, &[]);
 
         assert!(!result.needs_warning());
         assert_eq!(result.probe_file_count, 0);

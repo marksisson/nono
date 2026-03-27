@@ -48,4 +48,21 @@ fn main() {
         fs::write(out_path.join("nono-hook.sh"), &content)
             .expect("Failed to write hook script to OUT_DIR");
     }
+
+    // === Embed profile JSON Schema ===
+    let schema_path = Path::new("data/nono-profile.schema.json");
+    if schema_path.exists() {
+        let content = fs::read_to_string(schema_path).expect("Failed to read profile schema");
+        fs::write(out_path.join("nono-profile.schema.json"), &content)
+            .expect("Failed to write profile schema to OUT_DIR");
+    }
+
+    // === Embed profile authoring guide ===
+    let guide_path = Path::new("data/profile-authoring-guide.md");
+    if guide_path.exists() {
+        let content =
+            fs::read_to_string(guide_path).expect("Failed to read profile authoring guide");
+        fs::write(out_path.join("profile-authoring-guide.md"), &content)
+            .expect("Failed to write profile authoring guide to OUT_DIR");
+    }
 }

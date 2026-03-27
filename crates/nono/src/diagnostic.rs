@@ -20,7 +20,7 @@ use std::path::PathBuf;
 /// Why a path access was denied during a supervised session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenialReason {
-    /// Path is permanently blocked by security policy (never_grant)
+    /// Path is blocked by sandbox policy before approval is consulted
     PolicyBlocked,
     /// User declined the interactive approval prompt
     UserDenied,

@@ -1,8 +1,8 @@
 //! Trust policy loading, merging, and evaluation
 //!
 //! Provides functions for parsing trust policy JSON, merging multiple policies
-//! from different levels (embedded, user, project), and evaluating instruction
-//! files against the merged policy.
+//! from different levels (embedded, user, project), and evaluating files
+//! against the merged policy.
 //!
 //! # Policy Composition
 //!
@@ -10,7 +10,7 @@
 //! - Publishers: union (all publishers from all levels)
 //! - Blocklist digests: union (all blocked digests from all levels)
 //! - Blocked publishers: union
-//! - Instruction patterns: union (all patterns from all levels)
+//! - Include patterns: union (all patterns from all levels)
 //! - Enforcement: strictest wins (deny > warn > audit)
 //!
 //! Project-level policy cannot weaken user-level or embedded policy.
@@ -52,7 +52,7 @@ pub fn load_policy_from_file<P: AsRef<Path>>(path: P) -> Result<TrustPolicy> {
 ///
 /// Policies are merged in order (first = lowest priority, last = highest).
 /// All merging is additive-only:
-/// - Publishers, blocklist entries, blocked publishers, and instruction
+/// - Publishers, blocklist entries, blocked publishers, and include
 ///   patterns are unioned (deduplicated by identity)
 /// - Enforcement uses the strictest level across all policies
 ///
@@ -85,8 +85,8 @@ pub fn merge_policies(policies: &[TrustPolicy]) -> Result<TrustPolicy> {
     let mut strictest_enforcement = Enforcement::Audit;
 
     for policy in policies {
-        // Merge instruction patterns (deduplicate by pattern string)
-        for pattern in &policy.instruction_patterns {
+        // Merge include patterns (deduplicate by pattern string)
+        for pattern in &policy.includes {
             if seen_patterns.insert(pattern.clone()) {
                 merged_patterns.push(pattern.clone());
             }
@@ -97,8 +97,8 @@ pub fn merge_policies(policies: &[TrustPolicy]) -> Result<TrustPolicy> {
         // so user publishers take priority over project publishers.
         for publisher in &policy.publishers {
             if !seen_publisher_names.insert(publisher.name.clone()) {
-                tracing::warn!(
-                    "trust policy merge: publisher '{}' already defined in a higher-precedence policy, skipping duplicate",
+                tracing::debug!(
+                    "trust policy merge: publisher '{}' appears in multiple policies, using the user-level definition for verification",
                     publisher.name
                 );
             } else {
@@ -126,7 +126,7 @@ pub fn merge_policies(policies: &[TrustPolicy]) -> Result<TrustPolicy> {
 
     Ok(TrustPolicy {
         version: policies.iter().map(|p| p.version).max().unwrap_or(1),
-        instruction_patterns: merged_patterns,
+        includes: merged_patterns,
         publishers: merged_publishers,
         blocklist: Blocklist {
             digests: merged_digest_entries,
@@ -136,7 +136,7 @@ pub fn merge_policies(policies: &[TrustPolicy]) -> Result<TrustPolicy> {
     })
 }
 
-/// Evaluate an instruction file against a trust policy.
+/// Evaluate a file against a trust policy.
 ///
 /// Runs the full verification pipeline:
 /// 1. Blocklist check (fast reject by digest)
@@ -233,44 +233,89 @@ fn is_publisher_blocked(policy: &TrustPolicy, identity: &SignerIdentity) -> bool
         })
 }
 
+/// Well-known directory names that never contain instruction files and are
+/// typically very large. Sorted for binary search.
+const SKIP_DIRS: &[&str] = &[
+    ".cache",
+    ".git",
+    ".gradle",
+    ".hg",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".terraform",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+    "venv",
+];
+
 /// Scan a directory for files matching instruction patterns.
 ///
 /// Returns the list of paths that match any pattern in the trust policy.
-/// Does not recurse into hidden directories (prefixed with `.`) except
-/// `.claude/` which is explicitly included by standard instruction patterns.
+/// Hidden directories are scanned unless they are explicitly listed in the
+/// built-in heavy-directory skip set or provided via `extra_skip_dirs`.
 ///
 /// # Errors
 ///
 /// Returns `NonoError::TrustPolicy` if patterns cannot be compiled, or
 /// `NonoError::Io` if directory traversal fails.
-pub fn find_instruction_files<P: AsRef<Path>>(
+pub fn find_included_files<P: AsRef<Path>>(policy: &TrustPolicy, root: P) -> Result<Vec<PathBuf>> {
+    find_included_files_with_skip_dirs(policy, root, &[])
+}
+
+/// Scan a directory for files matching instruction patterns, skipping extra
+/// directory names in addition to the built-in heavy-directory list.
+pub fn find_included_files_with_skip_dirs<P: AsRef<Path>>(
     policy: &TrustPolicy,
     root: P,
+    extra_skip_dirs: &[String],
 ) -> Result<Vec<PathBuf>> {
     let root = root.as_ref();
-    let matcher = policy.instruction_matcher()?;
+    let matcher = policy.include_matcher()?;
+    let extra_skip_dirs: std::collections::HashSet<&str> =
+        extra_skip_dirs.iter().map(String::as_str).collect();
     let mut results = Vec::new();
     let mut visited = std::collections::HashSet::new();
 
-    find_files_recursive(root, root, &matcher, &mut results, &mut visited, 0)?;
+    if policy.includes.is_empty() {
+        return Ok(results);
+    }
+
+    find_files_recursive(
+        root,
+        root,
+        &matcher,
+        &extra_skip_dirs,
+        &mut results,
+        &mut visited,
+        0,
+    )?;
 
     results.sort();
     Ok(results)
 }
 
-/// Recursively walk a directory, collecting files matching instruction patterns.
-///
-/// Tracks visited directory inodes to prevent symlink cycle DoS, and enforces
-/// a maximum recursion depth of 16 levels.
+fn should_skip_dir(name: &str, extra_skip_dirs: &std::collections::HashSet<&str>) -> bool {
+    SKIP_DIRS.binary_search(&name).is_ok() || extra_skip_dirs.contains(name)
+}
+
 fn find_files_recursive(
     root: &Path,
     dir: &Path,
-    matcher: &super::types::InstructionPatterns,
+    matcher: &super::types::IncludePatterns,
+    extra_skip_dirs: &std::collections::HashSet<&str>,
     results: &mut Vec<PathBuf>,
-    visited: &mut std::collections::HashSet<u64>,
+    visited: &mut std::collections::HashSet<(u64, u64)>,
     depth: u32,
 ) -> Result<()> {
-    // Guard against deep recursion (legitimate instruction files live near the root)
     const MAX_DEPTH: u32 = 16;
     if depth > MAX_DEPTH {
         return Ok(());
@@ -281,47 +326,46 @@ fn find_files_recursive(
     for entry in entries {
         let entry = entry.map_err(NonoError::Io)?;
         let path = entry.path();
-
-        // Use std::fs::metadata (stat) instead of entry.file_type (lstat)
-        // to follow symlinks. A symlinked SKILLS.md must not be silently skipped.
         let meta = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue, // dangling symlink or permission error
+            Ok(metadata) => metadata,
+            Err(_) => continue,
         };
 
         if meta.is_dir() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            // Skip hidden directories except .claude
-            if name_str.starts_with('.') && name_str != ".claude" {
+            if should_skip_dir(&name_str, extra_skip_dirs) {
                 continue;
             }
 
-            // Track visited directory inodes to break symlink cycles.
-            // If we have already visited this inode, skip it entirely.
             #[cfg(unix)]
-            let inode = {
+            let file_id = Some({
                 use std::os::unix::fs::MetadataExt;
-                meta.ino()
-            };
+                (meta.dev(), meta.ino())
+            });
             #[cfg(not(unix))]
-            let inode = {
-                // On non-Unix, use depth limit as the sole cycle guard
-                0u64
-            };
+            let file_id: Option<(u64, u64)> = None;
 
-            if inode != 0 && !visited.insert(inode) {
-                continue;
+            if let Some(file_id) = file_id {
+                if !visited.insert(file_id) {
+                    continue;
+                }
             }
 
-            find_files_recursive(root, &path, matcher, results, visited, depth + 1)?;
+            find_files_recursive(
+                root,
+                &path,
+                matcher,
+                extra_skip_dirs,
+                results,
+                visited,
+                depth + 1,
+            )?;
         } else if meta.is_file() {
-            // Skip Sigstore sidecar bundles; only source instruction files should be scanned.
             if path.to_string_lossy().ends_with(".bundle") {
                 continue;
             }
 
-            // Match against relative path from root
             if let Ok(relative) = path.strip_prefix(root) {
                 if matcher.is_match(relative) {
                     results.push(path);
@@ -346,7 +390,7 @@ mod tests {
     ) -> TrustPolicy {
         TrustPolicy {
             version: 1,
-            instruction_patterns: vec!["SKILLS*".to_string(), "CLAUDE*".to_string()],
+            includes: vec!["SKILLS*".to_string(), "CLAUDE*".to_string()],
             publishers,
             blocklist: Blocklist {
                 digests: blocklist_digests,
@@ -390,7 +434,7 @@ mod tests {
     fn load_valid_policy() {
         let json = r#"{
             "version": 1,
-            "instruction_patterns": ["SKILLS*"],
+            "includes": ["SKILLS*"],
             "publishers": [],
             "blocklist": { "digests": [] },
             "enforcement": "deny"
@@ -398,14 +442,14 @@ mod tests {
         let policy = load_policy_from_str(json).unwrap();
         assert_eq!(policy.version, 1);
         assert_eq!(policy.enforcement, Enforcement::Deny);
-        assert_eq!(policy.instruction_patterns.len(), 1);
+        assert_eq!(policy.includes.len(), 1);
     }
 
     #[test]
     fn load_policy_with_publishers() {
         let json = r#"{
             "version": 1,
-            "instruction_patterns": ["SKILLS*"],
+            "includes": ["SKILLS*"],
             "publishers": [
                 {
                     "name": "local",
@@ -458,7 +502,7 @@ mod tests {
                 f,
                 r#"{{
                     "version": 1,
-                    "instruction_patterns": ["AGENT.MD"],
+                    "includes": ["AGENT.MD"],
                     "publishers": [],
                     "blocklist": {{ "digests": [] }},
                     "enforcement": "audit"
@@ -564,13 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn merge_unions_instruction_patterns() {
+    fn merge_unions_includes() {
         let mut p1 = make_policy(Enforcement::Audit, vec![], vec![]);
-        p1.instruction_patterns = vec!["SKILLS*".to_string()];
+        p1.includes = vec!["SKILLS*".to_string()];
         let mut p2 = make_policy(Enforcement::Audit, vec![], vec![]);
-        p2.instruction_patterns = vec!["AGENT.MD".to_string()];
+        p2.includes = vec!["AGENT.MD".to_string()];
         let merged = merge_policies(&[p1, p2]).unwrap();
-        assert_eq!(merged.instruction_patterns.len(), 2);
+        assert_eq!(merged.includes.len(), 2);
     }
 
     #[test]
@@ -579,7 +623,7 @@ mod tests {
         let p2 = make_policy(Enforcement::Audit, vec![], vec![]);
         // Both have "SKILLS*" and "CLAUDE*"
         let merged = merge_policies(&[p1, p2]).unwrap();
-        assert_eq!(merged.instruction_patterns.len(), 2);
+        assert_eq!(merged.includes.len(), 2);
     }
 
     #[test]
@@ -912,11 +956,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // find_instruction_files
+    // find_included_files
     // -----------------------------------------------------------------------
 
     #[test]
-    fn find_instruction_files_in_directory() {
+    fn find_included_files_in_directory() {
         let dir = tempfile::tempdir().unwrap();
         // Create matching files
         std::fs::write(dir.path().join("SKILLS.md"), "content").unwrap();
@@ -926,62 +970,104 @@ mod tests {
         std::fs::write(dir.path().join("main.rs"), "content").unwrap();
 
         let policy = make_policy(Enforcement::Deny, vec![], vec![]);
-        let files = find_instruction_files(&policy, dir.path()).unwrap();
+        let files = find_included_files(&policy, dir.path()).unwrap();
         assert_eq!(files.len(), 2);
     }
 
     #[test]
-    fn find_instruction_files_in_claude_subdir() {
+    fn find_included_files_in_claude_subdir() {
         let dir = tempfile::tempdir().unwrap();
         let claude_dir = dir.path().join(".claude").join("commands");
         std::fs::create_dir_all(&claude_dir).unwrap();
         std::fs::write(claude_dir.join("deploy.md"), "content").unwrap();
 
         let mut policy = make_policy(Enforcement::Deny, vec![], vec![]);
-        policy
-            .instruction_patterns
-            .push(".claude/**/*.md".to_string());
+        policy.includes.push(".claude/**/*.md".to_string());
 
-        let files = find_instruction_files(&policy, dir.path()).unwrap();
+        let files = find_included_files(&policy, dir.path()).unwrap();
         assert_eq!(files.len(), 1);
     }
 
     #[test]
-    fn find_instruction_files_skips_hidden_dirs() {
+    fn find_included_files_skips_git_dir() {
         let dir = tempfile::tempdir().unwrap();
         let hidden = dir.path().join(".git");
         std::fs::create_dir_all(&hidden).unwrap();
         std::fs::write(hidden.join("SKILLS.md"), "content").unwrap();
 
         let policy = make_policy(Enforcement::Deny, vec![], vec![]);
-        let files = find_instruction_files(&policy, dir.path()).unwrap();
+        let files = find_included_files(&policy, dir.path()).unwrap();
         assert!(files.is_empty());
     }
 
     #[test]
-    fn find_instruction_files_empty_dir() {
+    fn find_included_files_in_non_special_hidden_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join(".hidden").join("commands");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("deploy.md"), "content").unwrap();
+
+        let mut policy = make_policy(Enforcement::Deny, vec![], vec![]);
+        policy.includes.push(".hidden/**/*.md".to_string());
+
+        let files = find_included_files(&policy, dir.path()).unwrap();
+        assert_eq!(files, vec![hidden.join("deploy.md")]);
+    }
+
+    #[test]
+    fn find_included_files_skips_well_known_heavy_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_modules = dir.path().join("node_modules");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::write(node_modules.join("SKILLS.md"), "content").unwrap();
+        std::fs::write(dir.path().join("SKILLS.md"), "content").unwrap();
+
+        let policy = make_policy(Enforcement::Deny, vec![], vec![]);
+        let files = find_included_files(&policy, dir.path()).unwrap();
+
+        assert_eq!(files, vec![dir.path().join("SKILLS.md")]);
+    }
+
+    #[test]
+    fn find_included_files_respects_extra_skip_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let generated = dir.path().join("generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(generated.join("SKILLS.md"), "content").unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "content").unwrap();
+
+        let policy = make_policy(Enforcement::Deny, vec![], vec![]);
+        let files =
+            find_included_files_with_skip_dirs(&policy, dir.path(), &[String::from("generated")])
+                .unwrap();
+
+        assert_eq!(files, vec![dir.path().join("CLAUDE.md")]);
+    }
+
+    #[test]
+    fn find_included_files_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let policy = make_policy(Enforcement::Deny, vec![], vec![]);
-        let files = find_instruction_files(&policy, dir.path()).unwrap();
+        let files = find_included_files(&policy, dir.path()).unwrap();
         assert!(files.is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn find_instruction_files_follows_symlinks() {
+    fn find_included_files_follows_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("real_skills.md");
         std::fs::write(&target, "content").unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join("SKILLS.md")).unwrap();
 
         let policy = make_policy(Enforcement::Deny, vec![], vec![]);
-        let files = find_instruction_files(&policy, dir.path()).unwrap();
+        let files = find_included_files(&policy, dir.path()).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].to_string_lossy().contains("SKILLS.md"));
     }
 
     #[test]
-    fn find_instruction_files_skips_bundle_sidecars() {
+    fn find_included_files_skips_bundle_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("SKILLS.md"), "content").unwrap();
         std::fs::write(dir.path().join("SKILLS.md.bundle"), "{}").unwrap();
@@ -989,7 +1075,7 @@ mod tests {
         std::fs::write(dir.path().join("CLAUDE.md.bundle"), "{}").unwrap();
 
         let policy = make_policy(Enforcement::Deny, vec![], vec![]);
-        let files = find_instruction_files(&policy, dir.path()).unwrap();
+        let files = find_included_files(&policy, dir.path()).unwrap();
 
         assert_eq!(files.len(), 2);
         assert!(files

@@ -7,7 +7,19 @@ use crate::config;
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, NonoError, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Structured description of the capability that matched or nearly matched
+/// a query.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityMatch {
+    /// Granted path for the capability.
+    pub path: String,
+    /// Granted access mode.
+    pub access: String,
+    /// Capability source such as user, profile, group:<name>, or system.
+    pub source: String,
+}
 
 /// Result of querying whether an operation is permitted
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +33,8 @@ pub enum QueryResult {
         granted_path: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         access: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     /// The operation is denied
     #[serde(rename = "denied")]
@@ -28,6 +42,12 @@ pub enum QueryResult {
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy_source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        matching_capability: Option<CapabilityMatch>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suggested_flag: Option<String>,
     },
     /// Not running inside a sandbox
     #[serde(rename = "not_sandboxed")]
@@ -35,7 +55,16 @@ pub enum QueryResult {
 }
 
 /// Query whether a path operation is permitted
-pub fn query_path(path: &Path, requested: AccessMode, caps: &CapabilitySet) -> Result<QueryResult> {
+///
+/// `overridden_paths` contains canonicalized paths that have been exempted from
+/// deny groups via `override_deny`. The sensitive-path check is skipped for any
+/// query path that is equal to or a child of an overridden path.
+pub fn query_path(
+    path: &Path,
+    requested: AccessMode,
+    caps: &CapabilitySet,
+    overridden_paths: &[std::path::PathBuf],
+) -> Result<QueryResult> {
     // Canonicalize the path for proper comparison
     let canonical = if path.exists() {
         path.canonicalize()
@@ -63,15 +92,26 @@ pub fn query_path(path: &Path, requested: AccessMode, caps: &CapabilitySet) -> R
         }
     };
 
-    // First, check if this is a sensitive path (CLI security policy)
-    if let Some(matched) = config::check_sensitive_path(&canonical.to_string_lossy())? {
-        return Ok(QueryResult::Denied {
-            reason: "sensitive_path".to_string(),
-            details: Some(format!(
-                "Path matches sensitive pattern '{}'. Access blocked by security policy.",
-                matched
-            )),
-        });
+    // Check if this path is covered by an override_deny exemption
+    let is_overridden = overridden_paths
+        .iter()
+        .any(|op| canonical == *op || canonical.starts_with(op));
+
+    // Check if this is a sensitive path (CLI security policy), but skip
+    // the check for paths that have been explicitly overridden.
+    if !is_overridden {
+        if let Some(matched) = config::check_sensitive_path(&canonical.to_string_lossy())? {
+            return Ok(QueryResult::Denied {
+                reason: "sensitive_path".to_string(),
+                details: Some(format!(
+                    "Path is blocked by security policy: {}. It cannot be granted with path flags alone.",
+                    matched
+                )),
+                policy_source: Some(matched),
+                matching_capability: None,
+                suggested_flag: None,
+            });
+        }
     }
 
     // Check capabilities. Prefer the most specific matching grant so broad system
@@ -116,6 +156,7 @@ pub fn query_path(path: &Path, requested: AccessMode, caps: &CapabilitySet) -> R
             reason: "granted_path".to_string(),
             granted_path: Some(cap.resolved.display().to_string()),
             access: Some(cap.access.to_string()),
+            source: Some(cap.source.to_string()),
         });
     }
 
@@ -123,15 +164,31 @@ pub fn query_path(path: &Path, requested: AccessMode, caps: &CapabilitySet) -> R
         return Ok(QueryResult::Denied {
             reason: "insufficient_access".to_string(),
             details: Some(format!(
-                "Path is covered by capability with {} access, but {} was requested",
-                cap.access, requested
+                "Path is covered by '{}', which grants {} access from {} but {} was requested",
+                cap.resolved.display(),
+                cap.access,
+                cap.source,
+                requested
             )),
+            policy_source: None,
+            matching_capability: Some(CapabilityMatch {
+                path: cap.resolved.display().to_string(),
+                access: cap.access.to_string(),
+                source: cap.source.to_string(),
+            }),
+            suggested_flag: Some(suggested_flag_for_path(&canonical, requested)),
         });
     }
 
     Ok(QueryResult::Denied {
         reason: "path_not_granted".to_string(),
-        details: Some("Path is not covered by any capability".to_string()),
+        details: Some(format!(
+            "Path is not covered by any capability. Add {} to grant the requested access.",
+            suggested_flag_for_path(&canonical, requested)
+        )),
+        policy_source: None,
+        matching_capability: None,
+        suggested_flag: Some(suggested_flag_for_path(&canonical, requested)),
     })
 }
 
@@ -144,12 +201,16 @@ pub fn query_network(host: &str, port: u16, caps: &CapabilitySet) -> QueryResult
                 "Network access is blocked. Connection to {}:{} would be denied.",
                 host, port
             )),
+            policy_source: None,
+            matching_capability: None,
+            suggested_flag: None,
         }
     } else {
         QueryResult::Allowed {
             reason: "network_allowed".to_string(),
             granted_path: None,
             access: Some(format!("Connection to {}:{} would be allowed", host, port)),
+            source: None,
         }
     }
 }
@@ -161,6 +222,7 @@ pub fn print_result(result: &QueryResult) {
             reason,
             granted_path,
             access,
+            source,
         } => {
             println!("{}", "ALLOWED".green().bold());
             println!("  Reason: {}", reason);
@@ -170,12 +232,33 @@ pub fn print_result(result: &QueryResult) {
             if let Some(acc) = access {
                 println!("  Access: {}", acc);
             }
+            if let Some(src) = source {
+                println!("  Source: {}", src);
+            }
         }
-        QueryResult::Denied { reason, details } => {
+        QueryResult::Denied {
+            reason,
+            details,
+            policy_source,
+            matching_capability,
+            suggested_flag,
+        } => {
             println!("{}", "DENIED".red().bold());
             println!("  Reason: {}", reason);
             if let Some(d) = details {
                 println!("  Details: {}", d);
+            }
+            if let Some(policy) = policy_source {
+                println!("  Policy: {}", policy);
+            }
+            if let Some(cap) = matching_capability {
+                println!(
+                    "  Closest match: {} ({}, {})",
+                    cap.path, cap.access, cap.source
+                );
+            }
+            if let Some(flag) = suggested_flag {
+                println!("  Suggested fix: {}", flag);
             }
         }
         QueryResult::NotSandboxed { message } => {
@@ -183,6 +266,37 @@ pub fn print_result(result: &QueryResult) {
             println!("  {}", message);
         }
     }
+}
+
+fn suggested_flag_for_path(path: &Path, requested: AccessMode) -> String {
+    let (flag, target) = suggested_flag_parts(path, requested);
+    format!("{flag} {}", target.display())
+}
+
+fn suggested_flag_parts(path: &Path, requested: AccessMode) -> (&'static str, PathBuf) {
+    let flag = if path.is_file() {
+        match requested {
+            AccessMode::Read => "--read-file",
+            AccessMode::Write => "--write-file",
+            AccessMode::ReadWrite => "--allow-file",
+        }
+    } else {
+        match requested {
+            AccessMode::Read => "--read",
+            AccessMode::Write => "--write",
+            AccessMode::ReadWrite => "--allow",
+        }
+    };
+
+    let target = if path.exists() || path.is_dir() || path.parent().is_none() {
+        path.to_path_buf()
+    } else if let Some(parent) = path.parent() {
+        parent.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+
+    (flag, target)
 }
 
 #[cfg(test)]
@@ -206,9 +320,28 @@ mod tests {
 
         let test_file = dir.path().join("test.txt");
         std::fs::write(&test_file, "test").expect("Failed to write test file");
+        let expected_grant = dir
+            .path()
+            .canonicalize()
+            .expect("Failed to canonicalize dir");
 
-        let result = query_path(&test_file, AccessMode::Read, &caps).expect("Query failed");
-        assert!(matches!(result, QueryResult::Allowed { .. }));
+        let result = query_path(&test_file, AccessMode::Read, &caps, &[]).expect("Query failed");
+        match result {
+            QueryResult::Allowed {
+                source,
+                granted_path,
+                access,
+                ..
+            } => {
+                assert_eq!(source.as_deref(), Some("user"));
+                assert_eq!(
+                    granted_path.as_deref(),
+                    Some(expected_grant.to_string_lossy().as_ref())
+                );
+                assert_eq!(access.as_deref(), Some("read+write"));
+            }
+            _ => panic!("expected allowed result"),
+        }
     }
 
     #[test]
@@ -216,8 +349,20 @@ mod tests {
         let caps = CapabilitySet::new();
         let path = PathBuf::from("/some/random/path");
 
-        let result = query_path(&path, AccessMode::Read, &caps).expect("Query failed");
-        assert!(matches!(result, QueryResult::Denied { .. }));
+        let result = query_path(&path, AccessMode::Read, &caps, &[]).expect("Query failed");
+        match result {
+            QueryResult::Denied {
+                reason,
+                suggested_flag,
+                matching_capability,
+                ..
+            } => {
+                assert_eq!(reason, "path_not_granted");
+                assert_eq!(suggested_flag.as_deref(), Some("--read /some/random"));
+                assert!(matching_capability.is_none());
+            }
+            _ => panic!("expected denied result"),
+        }
     }
 
     #[test]
@@ -252,8 +397,74 @@ mod tests {
         let test_file = dir_canon.join("test.txt");
         std::fs::write(&test_file, "test").expect("Failed to write test file");
 
-        let result = query_path(&test_file, AccessMode::Write, &caps).expect("Query failed");
+        let result = query_path(&test_file, AccessMode::Write, &caps, &[]).expect("Query failed");
         assert!(matches!(result, QueryResult::Allowed { .. }));
+    }
+
+    #[test]
+    fn test_query_path_reports_near_miss_with_source_and_fix() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let dir_canon = dir.path().canonicalize().expect("Failed to canonicalize");
+        let test_file = dir.path().join("test.txt");
+        std::fs::write(&test_file, "test").expect("Failed to write test file");
+        let test_file_canon = test_file
+            .canonicalize()
+            .expect("Failed to canonicalize file");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: dir_canon.clone(),
+            resolved: dir_canon,
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Group("dev".to_string()),
+        });
+
+        let result = query_path(&test_file, AccessMode::Write, &caps, &[]).expect("Query failed");
+        match result {
+            QueryResult::Denied {
+                reason,
+                matching_capability,
+                suggested_flag,
+                details,
+                ..
+            } => {
+                let expected_flag = format!("--write-file {}", test_file_canon.display());
+                assert_eq!(reason, "insufficient_access");
+                assert_eq!(suggested_flag.as_deref(), Some(expected_flag.as_str()));
+                let capability = matching_capability.expect("expected matching capability");
+                assert_eq!(capability.access, "read");
+                assert_eq!(capability.source, "group:dev");
+                assert!(details
+                    .as_deref()
+                    .is_some_and(|d| d.contains("group:dev") && d.contains("write was requested")));
+            }
+            _ => panic!("expected denied result"),
+        }
+    }
+
+    #[test]
+    fn test_query_path_sensitive_policy_includes_policy_source() {
+        let ssh_path = PathBuf::from(format!(
+            "{}/.ssh",
+            crate::config::validated_home().expect("HOME should be valid in test")
+        ));
+        let caps = CapabilitySet::new();
+
+        let result = query_path(&ssh_path, AccessMode::Read, &caps, &[]).expect("Query failed");
+        match result {
+            QueryResult::Denied {
+                reason,
+                policy_source,
+                suggested_flag,
+                ..
+            } => {
+                assert_eq!(reason, "sensitive_path");
+                assert!(policy_source.is_some());
+                assert!(suggested_flag.is_none());
+            }
+            _ => panic!("expected denied result"),
+        }
     }
 
     #[test]

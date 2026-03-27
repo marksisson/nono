@@ -19,7 +19,7 @@ There are three trust domains:
 | Supervisor (parent) | Trusted | Receives trapped syscalls, consults approval backend, opens files, injects file descriptors |
 | Sandboxed child | Untrusted | Runs the agent command under full kernel enforcement |
 
-The supervisor is trusted but constrained. It can only grant access to files it can open itself (standard Unix permissions apply), and `never_grant` paths are checked before any approval backend is consulted.
+The supervisor is trusted but constrained. It can only grant access to files it can open itself (standard Unix permissions apply), and protected nono state roots are checked before any approval backend is consulted.
 
 When proxy mode is active, a fourth domain exists:
 
@@ -105,9 +105,9 @@ When the supervisor approves a request, it does not tell the child "go ahead and
 
 1. Reads the requested path from `/proc/CHILD/mem`
 2. Validates the notification is still live (`SECCOMP_IOCTL_NOTIF_ID_VALID`)
-3. Checks the path against `never_grant`
+3. Checks the path against protected nono state roots
 4. Canonicalizes the path to resolve symlinks
-5. Re-checks `never_grant` on the canonical path (a symlink from an innocuous path could point to a blocked target)
+5. Re-checks protected roots on the canonical path (a symlink from an innocuous path could point to a protected target)
 6. Walks the canonical path component-by-component using `openat` with `O_NOFOLLOW` at each step (prevents symlink substitution between canonicalization and open)
 7. Injects the resulting fd into the child via `SECCOMP_IOCTL_NOTIF_ADDFD` with `SECCOMP_ADDFD_FLAG_SEND`
 
@@ -147,7 +147,7 @@ Because `stat` and `access` are not trapped, the sandboxed child can enumerate f
 |---------|----------|-----------------|
 | Supervisor crashes | Notif fd closes; pending syscalls get `ENOSYS`; child falls back to Landlock | Safe — Landlock denies the access |
 | Supervisor denies request | Child receives `EPERM` | Safe — explicit denial |
-| `never_grant` match | Request rejected before approval backend is consulted | Safe — hard policy boundary |
+| Protected-root match | Request rejected before approval backend is consulted | Safe — protects internal nono state |
 | Rate limit exceeded | Request automatically denied | Safe — prevents prompt flooding |
 | Child exits during approval | `SECCOMP_IOCTL_NOTIF_ID_VALID` check fails; supervisor discards the request | Safe — no orphaned state |
 | Path canonicalization fails | Supervisor returns error to child | Safe — fail-closed |
@@ -167,7 +167,7 @@ The child cannot compromise the supervisor because the supervisor never runs unt
 The child's communication channels to the supervisor are:
 
 - **seccomp notification fd** — kernel-mediated. The child cannot forge or manipulate these; the kernel generates them from trapped syscalls.
-- **Unix socket** — length-prefixed JSON parsed by serde in memory-safe Rust. Malformed messages are rejected. Valid messages are checked against `never_grant`, rate-limited, and require user approval.
+- **Unix socket** — length-prefixed JSON parsed by serde in memory-safe Rust. Malformed messages are rejected. Valid messages are checked against protected roots, rate-limited, and require user approval.
 
 The child cannot `ptrace` the parent (blocked by yama `ptrace_scope` on most distributions, and the child's own seccomp filter restricts its syscalls). There is no shared memory, no signal-based control channel, and no way to inject code into the supervisor process.
 
@@ -217,7 +217,7 @@ The supervisor is not a privilege escalation target because it does not hold pri
 
 ## Network Proxy Security Model
 
-When `--network-profile` or `--allow-proxy` is used, nono starts an HTTP proxy in the supervisor process and restricts the child to `ProxyOnly` mode — only `localhost:<port>` is reachable from inside the sandbox.
+When `--network-profile` or `--allow-domain` is used, nono starts an HTTP proxy in the supervisor process and restricts the child to `ProxyOnly` mode — only `localhost:<port>` is reachable from inside the sandbox.
 
 ### Enforcement Layers
 
@@ -285,7 +285,7 @@ Supervised mode on macOS provides rollback snapshots (content-addressable filesy
 The architecture optimizes for three properties simultaneously:
 
 1. **Unprivileged deployment** — no root, no `CAP_SYS_ADMIN`, no kernel configuration changes. Works on any kernel 5.14+ out of the box.
-2. **Defense in depth** — Landlock provides a hard floor that catches failures in the dynamic layer. The supervisor can only grant what it can open. `never_grant` provides a policy ceiling that no approval can override.
+2. **Defense in depth** — Landlock provides a hard floor that catches failures in the dynamic layer. The supervisor can only grant what it can open. Protected-root checks ensure internal nono state remains off-limits to dynamic grants.
 3. **Transparency** — the sandboxed agent does not need to know about nono. Standard `open()` calls succeed after supervisor approval. No retries, no special APIs, no agent modifications.
 
 The result is a sandbox that is both strong (kernel-enforced, irreversible, fail-closed) and usable (agents work unmodified, users approve access interactively, the hot path has zero overhead).

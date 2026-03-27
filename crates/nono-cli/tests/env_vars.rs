@@ -131,56 +131,56 @@ fn cli_flag_overrides_env_var() {
 }
 
 #[test]
-fn env_nono_external_proxy() {
+fn env_nono_upstream_proxy() {
     let output = nono_bin()
-        .env("NONO_EXTERNAL_PROXY", "squid.corp:3128")
+        .env("NONO_UPSTREAM_PROXY", "squid.corp:3128")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
 
     assert!(
         output.status.success(),
-        "NONO_EXTERNAL_PROXY should be accepted, stderr: {}",
+        "NONO_UPSTREAM_PROXY should be accepted, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[test]
-fn env_nono_external_proxy_bypass_comma_separated() {
+fn env_nono_upstream_bypass_comma_separated() {
     let output = nono_bin()
-        .env("NONO_EXTERNAL_PROXY", "squid.corp:3128")
-        .env("NONO_EXTERNAL_PROXY_BYPASS", "internal.corp,*.private.net")
+        .env("NONO_UPSTREAM_PROXY", "squid.corp:3128")
+        .env("NONO_UPSTREAM_BYPASS", "internal.corp,*.private.net")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
 
     assert!(
         output.status.success(),
-        "NONO_EXTERNAL_PROXY_BYPASS should be accepted, stderr: {}",
+        "NONO_UPSTREAM_BYPASS should be accepted, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[test]
-fn env_nono_external_proxy_bypass_requires_external_proxy() {
-    // NONO_EXTERNAL_PROXY_BYPASS without NONO_EXTERNAL_PROXY should fail
+fn env_nono_upstream_bypass_requires_upstream_proxy() {
+    // NONO_UPSTREAM_BYPASS without NONO_UPSTREAM_PROXY should fail
     let output = nono_bin()
-        .env("NONO_EXTERNAL_PROXY_BYPASS", "internal.corp")
+        .env("NONO_UPSTREAM_BYPASS", "internal.corp")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
 
     assert!(
         !output.status.success(),
-        "NONO_EXTERNAL_PROXY_BYPASS without NONO_EXTERNAL_PROXY should fail"
+        "NONO_UPSTREAM_BYPASS without NONO_UPSTREAM_PROXY should fail"
     );
 }
 
 #[test]
-fn env_allow_net_conflicts_with_external_proxy() {
-    // NONO_ALLOW_NET + NONO_EXTERNAL_PROXY should conflict at the clap level.
+fn env_allow_net_conflicts_with_upstream_proxy() {
+    // NONO_ALLOW_NET + NONO_UPSTREAM_PROXY should conflict at the clap level.
     let output = nono_bin()
-        .env("NONO_EXTERNAL_PROXY", "squid.corp:3128")
+        .env("NONO_UPSTREAM_PROXY", "squid.corp:3128")
         .env("NONO_ALLOW_NET", "true")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
@@ -188,7 +188,7 @@ fn env_allow_net_conflicts_with_external_proxy() {
 
     assert!(
         !output.status.success(),
-        "NONO_ALLOW_NET + NONO_EXTERNAL_PROXY should conflict"
+        "NONO_ALLOW_NET + NONO_UPSTREAM_PROXY should conflict"
     );
 }
 

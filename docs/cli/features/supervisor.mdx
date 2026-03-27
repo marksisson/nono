@@ -33,8 +33,8 @@ On Linux, supervisor mode enables transparent capability expansion. When the san
 
 1. A seccomp BPF filter intercepts `openat`/`openat2` syscalls before they reach Landlock
 2. The supervisor reads the requested path from the child's memory
-3. The path is checked against the `never_grant` list (see below)
-4. If not blocked, the supervisor prompts the user for approval
+3. Protected nono state roots are checked first
+4. If the path is not protected, the supervisor prompts the user for approval
 5. On approval, the supervisor opens the file and injects the file descriptor into the child process via `SECCOMP_IOCTL_NOTIF_ADDFD`
 6. The child's `open()` call returns a valid file descriptor
 
@@ -64,22 +64,9 @@ Capability expansion is not available on macOS. Apple's SIP (System Integrity Pr
 
 On macOS, supervised mode provides rollback snapshots and the diagnostic footer, but does not prompt for capability expansion.
 
-## never_grant
+## Protected State
 
-The `never_grant` list defines paths that can never be granted through the supervisor, regardless of user approval. These are a hard safety net:
-
-| Path | Reason |
-|------|--------|
-| `/etc/shadow` | System password hashes |
-| `/etc/sudoers` | Sudo configuration |
-| `/etc/passwd` | User account database |
-| `/boot`, `/boot/grub` | Boot configuration |
-| `~/.ssh/authorized_keys` | SSH access control |
-| `~/.ssh/id_*` | SSH private keys |
-| `~/.gnupg` | GPG private keys |
-| macOS launch daemons | Persistence mechanisms |
-
-The `never_grant` check runs before any approval backend is consulted. These paths cannot be overridden by profiles, CLI flags, or user confirmation.
+The supervisor always blocks access to nono's own protected state roots, such as `~/.nono`, before consulting the approval backend. This prevents dynamic grants from exposing rollback data, audit state, or other internal nono files.
 
 ## Approval Backends
 

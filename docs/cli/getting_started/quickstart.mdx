@@ -33,12 +33,14 @@ See [Profiles & Groups](/cli/features/profiles-groups) for all built-in profiles
 
 | Command | Description |
 |---------|-------------|
-| `nono run` | Run a command inside the sandbox |
+| `nono run` | Run a command inside the sandbox (supervised, default) |
 | `nono shell` | Start an interactive shell inside the sandbox |
+| `nono wrap` | Apply sandbox and exec into command (no parent process, minimal overhead) |
 | `nono why` | Check why a path/network operation would be allowed or denied |
 | `nono rollback` | [Manage rollback sessions](/cli/features/atomic-rollbacks) - list, show, restore, verify, cleanup snapshots |
 | `nono audit` | [View audit trail](/cli/features/audit) - list and inspect past sandboxed sessions |
-| `nono learn` | [Discover required paths](/cli/features/learn) - trace a command to find what it accesses (Linux only) |
+| `nono learn` | [Discover required paths](/cli/features/learn) - trace a command to find what it accesses |
+| `nono trust` | [Manage instruction file trust](/cli/features/trust) - sign, verify, and manage attestation |
 | `nono setup` | System setup and verification - generate profiles, check shell integration |
 
 ## Permissions
@@ -69,20 +71,20 @@ Network is **allowed by default**. Use `--block-net` to disable outbound connect
 nono run --allow . --block-net -- cargo build
 ```
 
-For granular control, use `--network-profile` for host-level filtering, `--allow-net` to override proxy filtering for one session, or `--allow-port` for localhost IPC between sandboxes:
+For granular control, use `--network-profile` for host-level filtering or `--open-port` for localhost IPC between sandboxes:
 
 ```bash
 # Host-level filtering via proxy
 nono run --allow . --network-profile claude-code -- my-agent
 
-# Keep a built-in profile but temporarily disable its proxy filtering
-nono run --profile claude-code --allow-net -- claude
+# Allow specific domains through the proxy
+nono run --allow . --allow-domain api.openai.com -- my-agent
 
 # Localhost IPC (e.g., MCP server on port 3000)
-nono run --block-net --allow-port 3000 --allow . -- my-agent
+nono run --block-net --open-port 3000 --allow . -- my-agent
 ```
 
-See [Network Filtering](/cli/features/network-proxy) and [CLI Reference](/cli/usage/flags) for details.
+See [Networking](/cli/features/networking) and [CLI Reference](/cli/usage/flags) for details.
 
 ## Interactive Shell (`nono shell`)
 

@@ -69,7 +69,7 @@ impl RateLimiter {
 /// 1. Receive notification (blocking recv from kernel)
 /// 2. Read path from child's /proc/PID/mem
 /// 3. TOCTOU check: verify notification still valid
-/// 4. Check never_grant -> deny (BEFORE initial-set fast-path)
+/// 4. Check protected nono state roots -> deny (BEFORE initial-set fast-path)
 /// 5. Fast-path: if path is in initial set, open + inject fd immediately
 /// 6. Rate limit check -> deny if exceeded
 /// 7. Trust verification for instruction files (if trust_interceptor present)
@@ -188,31 +188,24 @@ pub(super) fn handle_seccomp_notification(
     let canonicalized =
         std::fs::canonicalize(&resolved_path).unwrap_or_else(|_| resolved_path.clone());
 
-    // 4. Check never_grant BEFORE initial-set fast-path.
-    let never_grant_check = config.never_grant.check(&canonicalized);
-    if !never_grant_check.is_blocked() {
-        let never_grant_original = config.never_grant.check(&resolved_path);
-        if never_grant_original.is_blocked() {
-            debug!(
-                "Seccomp: path {} (via {}) blocked by never_grant",
-                canonicalized.display(),
-                path.display()
-            );
-            record_denial(
-                denials,
-                DenialRecord {
-                    path: path.clone(),
-                    access,
-                    reason: DenialReason::PolicyBlocked,
-                },
-            );
-            let _ = deny_notif(notify_fd, notif.id);
-            return Ok(());
-        }
-    } else {
+    // 4. Check protected roots BEFORE initial-set fast-path.
+    let protected_root = crate::protected_paths::overlapping_protected_root(
+        &canonicalized,
+        false,
+        config.protected_roots,
+    )
+    .or_else(|| {
+        crate::protected_paths::overlapping_protected_root(
+            &resolved_path,
+            false,
+            config.protected_roots,
+        )
+    });
+    if let Some(protected_root) = protected_root {
         debug!(
-            "Seccomp: path {} blocked by never_grant",
-            canonicalized.display()
+            "Seccomp: path {} blocked by protected root {}",
+            canonicalized.display(),
+            protected_root.display()
         );
         record_denial(
             denials,
@@ -243,7 +236,7 @@ pub(super) fn handle_seccomp_notification(
             match open_path_for_access(
                 &path,
                 &access,
-                config.never_grant,
+                config.protected_roots,
                 None,
                 Some(procfs_context),
             ) {
@@ -424,7 +417,7 @@ pub(super) fn handle_seccomp_notification(
         match open_path_for_access(
             &path,
             &access,
-            config.never_grant,
+            config.protected_roots,
             verified_digest.as_deref(),
             Some(procfs_context),
         ) {
@@ -453,6 +446,110 @@ pub(super) fn handle_seccomp_notification(
         }
     } else {
         let _ = deny_notif(notify_fd, notif.id);
+    }
+
+    Ok(())
+}
+
+/// Handle a seccomp notification for connect() or bind() syscalls.
+///
+/// This is the proxy-only fallback for kernels without Landlock AccessNet.
+/// The BPF filter routes connect/bind to USER_NOTIF; this function reads
+/// the sockaddr from the child's memory and allows or denies based on
+/// the configured proxy port and bind ports.
+///
+/// For connect: allow only loopback + proxy port. Deny everything else.
+/// For bind: allow only ports in the bind_ports list. Deny everything else.
+///
+/// Uses SECCOMP_USER_NOTIF_FLAG_CONTINUE on approval (safe for connect/bind
+/// because the kernel has already copied sockaddr into kernel memory).
+pub(super) fn handle_network_notification(
+    notify_fd: std::os::fd::RawFd,
+    config: &SupervisorConfig<'_>,
+    rate_limiter: &mut RateLimiter,
+) -> nono::error::Result<()> {
+    use nono::sandbox::{
+        continue_notif, deny_notif, notif_id_valid, read_notif_sockaddr, recv_notif,
+        respond_notif_errno, SYS_BIND, SYS_CONNECT,
+    };
+
+    let notif = recv_notif(notify_fd)?;
+
+    // Rate limit to prevent flooding
+    if !rate_limiter.try_acquire() {
+        debug!("Rate limited network seccomp notification, denying");
+        let _ = deny_notif(notify_fd, notif.id);
+        return Ok(());
+    }
+
+    // Read sockaddr from child's memory: args[1] = sockaddr*, args[2] = addrlen
+    let sockaddr = match read_notif_sockaddr(notif.pid, notif.data.args[1], notif.data.args[2]) {
+        Ok(info) => info,
+        Err(e) => {
+            debug!("Failed to read sockaddr from seccomp notification: {}", e);
+            let _ = deny_notif(notify_fd, notif.id);
+            return Ok(());
+        }
+    };
+
+    // TOCTOU check
+    if !notif_id_valid(notify_fd, notif.id)? {
+        debug!("Network seccomp notification expired (TOCTOU check)");
+        return Ok(());
+    }
+
+    let allowed = match notif.data.nr {
+        SYS_CONNECT => {
+            // Allow connect only to loopback + proxy port
+            let port_match = sockaddr.port == config.proxy_port;
+            if sockaddr.is_loopback && port_match {
+                debug!(
+                    "Proxy seccomp: allowing connect to loopback:{}",
+                    sockaddr.port
+                );
+                true
+            } else {
+                debug!(
+                    "Proxy seccomp: denying connect to family={} port={} loopback={}",
+                    sockaddr.family, sockaddr.port, sockaddr.is_loopback
+                );
+                false
+            }
+        }
+        SYS_BIND => {
+            // Allow bind only on configured bind ports
+            let port_allowed = config.proxy_bind_ports.contains(&sockaddr.port);
+            if port_allowed {
+                debug!("Proxy seccomp: allowing bind on port {}", sockaddr.port);
+                true
+            } else {
+                debug!(
+                    "Proxy seccomp: denying bind on port {} (allowed: {:?})",
+                    sockaddr.port, config.proxy_bind_ports
+                );
+                false
+            }
+        }
+        other => {
+            warn!(
+                "Unexpected syscall {} in proxy seccomp handler, denying",
+                other
+            );
+            false
+        }
+    };
+
+    if allowed {
+        // SECCOMP_USER_NOTIF_FLAG_CONTINUE: let the kernel proceed with its
+        // already-copied sockaddr. Safe for connect/bind (move_addr_to_kernel).
+        if let Err(e) = continue_notif(notify_fd, notif.id) {
+            debug!("continue_notif failed for network notification: {}", e);
+            // Must respond to avoid leaving the child blocked. Propagate if
+            // deny also fails — the notification is orphaned.
+            return deny_notif(notify_fd, notif.id);
+        }
+    } else {
+        respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
     }
 
     Ok(())

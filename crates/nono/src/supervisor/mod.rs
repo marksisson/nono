@@ -11,30 +11,24 @@
 //! ```
 //!
 //! The child sends [`CapabilityRequest`]s over a [`SupervisorSocket`]. The
-//! supervisor checks the request against [`NeverGrantChecker`] (permanently
-//! blocked paths), then delegates to an [`ApprovalBackend`] for the decision.
-//! If granted, the supervisor opens the path and passes the fd back via
-//! `SCM_RIGHTS`.
+//! supervisor delegates to an [`ApprovalBackend`] for the decision. If granted,
+//! the supervisor opens the path and passes the fd back via `SCM_RIGHTS`.
 //!
 //! # Components
 //!
 //! - **Types** ([`types`]): IPC message types (`CapabilityRequest`, `ApprovalDecision`, `AuditEntry`)
 //! - **Socket** ([`socket`]): Unix domain socket with length-prefixed framing and fd-passing
-//! - **NeverGrant** ([`never_grant`]): Path validation against the `never_grant` list
 //! - **ApprovalBackend** (this module): Trait for pluggable approval decisions
 //!
 //! # Security
 //!
 //! - All messages are length-prefixed with a 64 KiB cap to prevent memory exhaustion
 //! - Peer authentication via `SO_PEERCRED` (Linux) / `LOCAL_PEERPID` (macOS)
-//! - `never_grant` paths are rejected before the approval backend is consulted
 //! - Path comparison uses [`Path::starts_with()`], never string operations
 
-pub mod never_grant;
 pub mod socket;
 pub mod types;
 
-pub use never_grant::{NeverGrantChecker, NeverGrantResult};
 pub use socket::SupervisorSocket;
 pub use types::{
     ApprovalDecision, AuditEntry, CapabilityRequest, SupervisorMessage, SupervisorResponse,
@@ -46,7 +40,6 @@ use crate::error::Result;
 /// Trait for pluggable approval backends.
 ///
 /// Implementors decide whether to grant or deny a [`CapabilityRequest`].
-/// The supervisor calls this after `never_grant` checking passes.
 ///
 /// # Built-in implementations (in nono-cli)
 ///

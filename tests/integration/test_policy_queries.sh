@@ -32,17 +32,39 @@ expect_output_contains "sensitive path is denied" "\"reason\": \"sensitive_path\
 expect_output_contains "non-granted path is denied" "\"reason\": \"path_not_granted\"" \
     "$NONO_BIN" --silent why --json --path "$DENIED_PATH" --op read
 
+expect_output_contains "non-granted path suggests exact flag" "\"suggested_flag\": \"--read $HOME\"" \
+    "$NONO_BIN" --silent why --json --path "$DENIED_PATH" --op read
+
 expect_output_contains "allow grants write for matching path" "\"status\": \"allowed\"" \
+    "$NONO_BIN" --silent why --json --path "$TMPDIR/write-target.txt" --op write --allow "$TMPDIR"
+
+expect_output_contains "allowed path reports source" "\"source\": \"user\"" \
     "$NONO_BIN" --silent why --json --path "$TMPDIR/write-target.txt" --op write --allow "$TMPDIR"
 
 expect_output_contains "read-only grant blocks write operation" "\"reason\": \"insufficient_access\"" \
     "$NONO_BIN" --silent why --json --path "$READONLY_DIR/read-only-target.txt" --op write --read "$READONLY_DIR"
 
+expect_output_contains "insufficient access reports matching capability source" "\"source\": \"user\"" \
+    "$NONO_BIN" --silent why --json --path "$READONLY_DIR/read-only-target.txt" --op write --read "$READONLY_DIR"
+
+expect_output_contains "human why output shows closest match" "Closest match:" \
+    "$NONO_BIN" --silent why --path "$READONLY_DIR/read-only-target.txt" --op write --read "$READONLY_DIR"
+
+expect_output_contains "human why output shows suggested fix" "Suggested fix: --write-file $READONLY_DIR/read-only-target.txt" \
+    "$NONO_BIN" --silent why --path "$READONLY_DIR/read-only-target.txt" --op write --read "$READONLY_DIR"
+
+expect_output_contains "human why output shows source on allow" "Source: user" \
+    "$NONO_BIN" --silent why --path "$TMPDIR/write-target.txt" --op write --allow "$TMPDIR"
+
 if [[ -f ~/.zshrc ]]; then
     expect_output_contains "read-file on sensitive path stays denied" "\"reason\": \"sensitive_path\"" \
         "$NONO_BIN" --silent why --json --path ~/.zshrc --op read --read-file ~/.zshrc
+
+    expect_output_contains "sensitive path reports policy source in human output" "Policy:" \
+        "$NONO_BIN" --silent why --path ~/.zshrc --op read --read-file ~/.zshrc
 else
     skip_test "read-file on sensitive path stays denied" "~/.zshrc not found"
+    skip_test "sensitive path reports policy source in human output" "~/.zshrc not found"
 fi
 
 echo ""

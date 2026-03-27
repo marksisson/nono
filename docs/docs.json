@@ -38,12 +38,14 @@
         "group": "Features",
         "pages": [
           "cli/features/profiles-groups",
+          "cli/features/profile-authoring",
           "cli/features/atomic-rollbacks",
           "cli/features/audit",
           "cli/features/supervisor",
-          "cli/features/network-proxy",
+          "cli/features/networking",
           "cli/features/credential-injection",
           "cli/features/execution-modes",
+          "cli/features/policy-introspection",
           "cli/features/learn",
           "cli/features/trust"
         ]

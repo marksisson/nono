@@ -413,6 +413,32 @@ pub enum ProcessInfoMode {
     AllowAll,
 }
 
+/// IPC mode for the sandbox.
+///
+/// Controls whether the sandboxed process can use POSIX IPC primitives
+/// (semaphores) beyond shared memory. Shared memory (`shm_open`) is always
+/// allowed; this mode gates semaphore operations needed by multiprocessing
+/// runtimes (e.g., Python `multiprocessing`, Ruby `parallel`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IpcMode {
+    /// POSIX shared memory only (default). Semaphore operations are denied.
+    ///
+    /// On macOS: only `ipc-posix-shm-*` rules emitted. `sem_open()` etc.
+    /// are blocked by the `(deny default)` baseline.
+    ///
+    /// On Linux: no-op (Landlock does not restrict IPC primitives).
+    #[default]
+    SharedMemoryOnly,
+    /// Full POSIX IPC: shared memory + semaphores.
+    ///
+    /// On macOS: adds `ipc-posix-sem-*` rules to the Seatbelt profile.
+    /// Required for Python `multiprocessing`, Node `worker_threads` with
+    /// shared memory, and similar multiprocess coordination.
+    ///
+    /// On Linux: no-op (Landlock does not restrict IPC primitives).
+    Full,
+}
+
 /// forcing all traffic through the nono proxy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkMode {
@@ -506,6 +532,8 @@ pub struct CapabilitySet {
     signal_mode: SignalMode,
     /// Process inspection mode (default: Isolated).
     process_info_mode: ProcessInfoMode,
+    /// IPC mode (default: SharedMemoryOnly).
+    ipc_mode: IpcMode,
     /// Enable sandbox extension support for runtime capability expansion.
     /// On macOS, adds extension filter rules to the Seatbelt profile so that
     /// `sandbox_extension_consume()` tokens can expand the sandbox dynamically.
@@ -652,6 +680,17 @@ impl CapabilitySet {
         self
     }
 
+    /// Set IPC mode (builder pattern)
+    ///
+    /// Controls whether the sandboxed process can use POSIX semaphores.
+    /// Shared memory is always allowed; `IpcMode::Full` additionally enables
+    /// semaphore operations required by multiprocessing runtimes.
+    #[must_use]
+    pub fn set_ipc_mode(mut self, mode: IpcMode) -> Self {
+        self.ipc_mode = mode;
+        self
+    }
+
     /// Allow signals to any process (builder pattern)
     ///
     /// Disables signal isolation. By default, sandboxed processes can only
@@ -741,6 +780,11 @@ impl CapabilitySet {
         self.process_info_mode = mode;
     }
 
+    /// Set IPC mode (mutable)
+    pub fn set_ipc_mode_mut(&mut self, mode: IpcMode) {
+        self.ipc_mode = mode;
+    }
+
     /// Add a TCP connect port to the allowlist (mutable)
     pub fn add_tcp_connect_port(&mut self, port: u16) {
         self.tcp_connect_ports.push(port);
@@ -781,6 +825,22 @@ impl CapabilitySet {
         Ok(())
     }
 
+    /// Remove exact file capabilities whose original or resolved path matches
+    /// any of the provided denied paths.
+    ///
+    /// Directory capabilities are preserved so platform-specific deny rules can
+    /// still narrow access within an allowed tree.
+    pub fn remove_exact_file_caps_for_paths(&mut self, denied_paths: &[PathBuf]) -> usize {
+        let before = self.fs.len();
+        self.fs.retain(|cap| {
+            !cap.is_file
+                || !denied_paths
+                    .iter()
+                    .any(|denied| cap.original == *denied || cap.resolved == *denied)
+        });
+        before.saturating_sub(self.fs.len())
+    }
+
     // Accessors
 
     /// Get filesystem capabilities
@@ -811,6 +871,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn process_info_mode(&self) -> ProcessInfoMode {
         self.process_info_mode
+    }
+
+    /// Get the IPC mode
+    #[must_use]
+    pub fn ipc_mode(&self) -> IpcMode {
+        self.ipc_mode
     }
 
     /// Get the network mode
@@ -1689,6 +1755,26 @@ mod tests {
     }
 
     #[test]
+    fn test_ipc_mode_default_is_shared_memory_only() {
+        let caps = CapabilitySet::new();
+        assert_eq!(caps.ipc_mode(), IpcMode::SharedMemoryOnly);
+    }
+
+    #[test]
+    fn test_ipc_mode_full() {
+        let caps = CapabilitySet::new().set_ipc_mode(IpcMode::Full);
+        assert_eq!(caps.ipc_mode(), IpcMode::Full);
+    }
+
+    #[test]
+    fn test_ipc_mode_mutable_setter() {
+        let mut caps = CapabilitySet::new();
+        assert_eq!(caps.ipc_mode(), IpcMode::SharedMemoryOnly);
+        caps.set_ipc_mode_mut(IpcMode::Full);
+        assert_eq!(caps.ipc_mode(), IpcMode::Full);
+    }
+
+    #[test]
     fn test_access_mode_contains() {
         // ReadWrite subsumes everything
         assert!(AccessMode::ReadWrite.contains(AccessMode::Read));
@@ -1779,5 +1865,24 @@ mod tests {
         caps.add_fs(FsCapability::new_file(&file_path, AccessMode::ReadWrite).unwrap());
 
         assert!(!caps.path_covered_with_access(&file_canonical, AccessMode::Read));
+    }
+
+    #[test]
+    fn test_remove_exact_file_caps_for_paths_matches_original_and_resolved() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        fs::write(&target, "secret").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_file(&link, AccessMode::Read).unwrap());
+        caps.add_fs(FsCapability::new_dir(dir.path(), AccessMode::Read).unwrap());
+
+        let removed = caps.remove_exact_file_caps_for_paths(&[link.clone(), target.clone()]);
+
+        assert_eq!(removed, 1);
+        assert_eq!(caps.fs_capabilities().len(), 1);
+        assert!(!caps.fs_capabilities()[0].is_file);
     }
 }

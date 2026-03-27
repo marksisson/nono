@@ -19,13 +19,6 @@ use tracing::{debug, warn};
 pub struct Policy {
     #[allow(dead_code)]
     pub meta: PolicyMeta,
-    /// Paths that can never be granted via supervisor IPC, regardless of user approval.
-    /// Consumed by `NeverGrantChecker` during supervisor orchestration.
-    #[serde(default)]
-    pub never_grant: Vec<String>,
-    /// Default groups applied to all sandbox invocations
-    #[serde(default)]
-    pub base_groups: Vec<String>,
     pub groups: HashMap<String, Group>,
     /// Built-in profile definitions
     #[serde(default)]
@@ -49,7 +42,7 @@ pub struct Group {
     /// If set, this group only applies on the specified platform
     #[serde(default)]
     pub platform: Option<String>,
-    /// If true, this group cannot be removed via trust_groups
+    /// If true, this group cannot be removed via group exclusions
     #[serde(default)]
     pub required: bool,
     /// Allow operations
@@ -94,22 +87,26 @@ pub struct DenyOps {
     pub commands: Vec<String>,
 }
 
-/// Profile definition as stored in policy.json
+/// Profile definition as stored in policy.json.
 ///
-/// Separate from `profile::Profile` because in JSON `trust_groups` lives at the
-/// profile level and `security.groups` means "additional groups on top of base",
-/// not the complete merged list.
+/// Separate from `profile::Profile` because built-in policy profiles allow
+/// profile-level group exclusion fields, while `security.groups` means
+/// "additional groups on top of base", not the complete merged list.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProfileDef {
+    #[serde(default)]
+    pub extends: Option<String>,
     #[serde(default)]
     pub meta: profile::ProfileMeta,
     #[serde(default)]
     pub security: profile::SecurityConfig,
-    /// Base groups to exclude for this profile
+    /// Preferred built-in profile exclusions.
     #[serde(default)]
-    pub trust_groups: Vec<String>,
+    pub exclude_groups: Vec<String>,
     #[serde(default)]
     pub filesystem: profile::FilesystemConfig,
+    #[serde(default)]
+    pub policy: profile::PolicyPatchConfig,
     #[serde(default)]
     pub network: profile::NetworkConfig,
     #[serde(default, alias = "secrets")]
@@ -129,33 +126,24 @@ pub struct ProfileDef {
 }
 
 impl ProfileDef {
-    /// Convert to a full Profile with merged group list.
-    ///
-    /// Computes: `(base_groups - trust_groups) + security.groups`
-    ///
-    /// Returns an error if trust_groups attempts to remove a required group.
-    pub fn to_profile(&self, base_groups: &[String], policy: &Policy) -> Result<profile::Profile> {
-        validate_trust_groups(policy, &self.trust_groups)?;
-
-        let mut groups: Vec<String> = base_groups
-            .iter()
-            .filter(|g| !self.trust_groups.contains(g))
-            .cloned()
-            .collect();
-        groups.extend(self.security.groups.clone());
-
-        Ok(profile::Profile {
-            extends: None,
+    /// Convert to a raw Profile without merging implicit default groups.
+    pub fn to_raw_profile(&self) -> profile::Profile {
+        let mut policy = self.policy.clone();
+        policy.exclude_groups =
+            profile::dedup_append(&self.exclude_groups, &self.policy.exclude_groups);
+        profile::Profile {
+            extends: self.extends.as_ref().map(|s| vec![s.clone()]),
             meta: self.meta.clone(),
             security: profile::SecurityConfig {
-                groups,
-                trust_groups: self.trust_groups.clone(),
+                groups: self.security.groups.clone(),
                 allowed_commands: self.security.allowed_commands.clone(),
                 signal_mode: self.security.signal_mode,
                 process_info_mode: self.security.process_info_mode,
+                ipc_mode: self.security.ipc_mode,
                 capability_elevation: self.security.capability_elevation,
             },
             filesystem: self.filesystem.clone(),
+            policy,
             network: self.network.clone(),
             env_credentials: self.env_credentials.clone(),
             workdir: self.workdir.clone(),
@@ -164,7 +152,8 @@ impl ProfileDef {
             open_urls: self.open_urls.clone(),
             allow_launch_services: self.allow_launch_services,
             interactive: self.interactive,
-        })
+            skipdirs: Vec::new(),
+        }
     }
 }
 
@@ -173,7 +162,7 @@ impl ProfileDef {
 // ============================================================================
 
 /// Current platform identifier
-fn current_platform() -> &'static str {
+pub(crate) fn current_platform() -> &'static str {
     if cfg!(target_os = "macos") {
         "macos"
     } else if cfg!(target_os = "linux") {
@@ -184,7 +173,7 @@ fn current_platform() -> &'static str {
 }
 
 /// Check if a group applies to the current platform
-fn group_matches_platform(group: &Group) -> bool {
+pub(crate) fn group_matches_platform(group: &Group) -> bool {
     match &group.platform {
         Some(platform) => platform == current_platform(),
         None => true, // No platform restriction = applies everywhere
@@ -198,7 +187,7 @@ fn group_matches_platform(group: &Group) -> bool {
 /// Expand `~` to $HOME and `$TMPDIR` to the environment variable value.
 ///
 /// Returns an error if HOME or TMPDIR are set to non-absolute paths.
-fn expand_path(path_str: &str) -> Result<PathBuf> {
+pub(crate) fn expand_path(path_str: &str) -> Result<PathBuf> {
     use crate::config;
 
     let expanded = if let Some(rest) = path_str.strip_prefix("~/") {
@@ -442,19 +431,72 @@ fn add_fs_capability(
     Ok(())
 }
 
+/// Resolve symlinks in parent directories when the leaf path does not exist.
+///
+/// `path.canonicalize()` fails when the leaf is absent (e.g. a socket that
+/// hasn't been created yet). This helper walks upward until it finds an
+/// existing ancestor, canonicalizes it, then re-appends the non-existent
+/// suffix components. Returns `Ok(None)` when no symlinks are found in
+/// parents (resolved path equals the original).
+///
+/// Example on macOS:
+/// - requested path: `/var/run/future.sock`
+/// - `/future.sock` doesn't exist, but `/var/run` does
+/// - `/var/run` canonicalizes to `/private/var/run`
+/// - result: `Some("/private/var/run/future.sock")`
+fn resolve_parent_symlinks(path: &Path) -> Result<Option<PathBuf>> {
+    let mut suffix = Vec::new();
+    let mut cur = path;
+
+    loop {
+        if cur.exists() {
+            break;
+        }
+        let name = cur.file_name().ok_or_else(|| {
+            NonoError::ConfigParse(format!(
+                "cannot resolve parent symlinks for {}",
+                path.display()
+            ))
+        })?;
+        suffix.push(name.to_os_string());
+        cur = cur.parent().ok_or_else(|| {
+            NonoError::ConfigParse(format!(
+                "cannot resolve parent symlinks for {}",
+                path.display()
+            ))
+        })?;
+    }
+
+    let mut resolved = cur
+        .canonicalize()
+        .map_err(|e| NonoError::ConfigParse(format!("canonicalize {}: {}", cur.display(), e)))?;
+    for part in suffix.iter().rev() {
+        resolved.push(part);
+    }
+
+    Ok((resolved != path).then_some(resolved))
+}
+
 /// Add deny.access rules, collecting the expanded path for validation.
 ///
 /// On macOS, generates Seatbelt platform rules:
 /// - `(allow file-read-metadata ...)` — programs can stat/check existence
 /// - `(deny file-read-data ...)` — deny reading content
 /// - `(deny file-write* ...)` — deny writing
+/// - `(deny network-outbound (path ...))` — blocks Unix socket connections
 ///
 /// On Linux, deny paths are collected for overlap validation only —
 /// Landlock has no deny semantics so platform rules would be ignored.
 ///
 /// Uses `subpath` for directories, `literal` for files.
 /// For non-existent paths, defaults to `subpath` (defensive).
-fn add_deny_access_rules(
+///
+/// Both the original and the kernel-resolved (canonical) path receive deny
+/// rules so Seatbelt matches regardless of which form the kernel sees.
+/// When the leaf does not yet exist (e.g. a future socket), parent symlinks
+/// are resolved via `resolve_parent_symlinks` so the derived canonical path
+/// is also covered.
+pub(crate) fn add_deny_access_rules(
     path_str: &str,
     caps: &mut CapabilitySet,
     deny_paths: &mut Vec<PathBuf>,
@@ -462,66 +504,91 @@ fn add_deny_access_rules(
     let path = expand_path(path_str)?;
     deny_paths.push(path.clone());
 
-    // If the deny path is a symlink, also deny the resolved target.
-    // Without this, `--read-file ~/.zshrc` where ~/.zshrc is a symlink
-    // canonicalizes to the target, which wouldn't match the deny path.
-    let resolved = if path.is_symlink() {
-        path.canonicalize().ok()
+    // Canonicalize to resolve symlinks anywhere in the path (the deny target
+    // itself, or any parent directory such as /var -> /private/var on macOS).
+    // Seatbelt operates on kernel-resolved paths, so deny rules must use
+    // the canonical form. We also keep the original to cover both forms.
+    let canonical = path.canonicalize().ok();
+    if let Some(ref canonical) = canonical {
+        if *canonical != path {
+            deny_paths.push(canonical.clone());
+        }
+    }
+
+    // When the full path doesn't exist yet (canonicalize failed), resolve
+    // symlinks in parent directories so the derived canonical path is still
+    // covered — important for sockets that are created after sandbox_init.
+    let parent_resolved = if canonical.is_none() {
+        match resolve_parent_symlinks(&path) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                warn!(
+                    "Skipping parent-symlink resolution for {}: {}",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
     } else {
         None
     };
-    if let Some(ref resolved) = resolved {
-        if *resolved != path {
-            deny_paths.push(resolved.clone());
-        }
+    if let Some(ref resolved) = parent_resolved {
+        deny_paths.push(resolved.clone());
     }
 
     // Seatbelt deny rules only apply on macOS
     if cfg!(target_os = "macos") {
-        let escaped = escape_seatbelt_path(path_to_utf8(&path)?)?;
-
-        // Determine filter type: literal for files, subpath for directories
-        let filter = if path.exists() && path.is_file() {
-            format!("literal \"{}\"", escaped)
-        } else {
-            // Default to subpath for dirs and non-existent paths (defensive)
-            format!("subpath \"{}\"", escaped)
+        // Helper: emit metadata-allow + read-deny + write-deny + network-deny for a single path
+        let emit_deny_rules = |p: &Path, caps: &mut CapabilitySet| -> Result<()> {
+            let escaped = escape_seatbelt_path(path_to_utf8(p)?)?;
+            let filter = if p.exists() && p.is_file() {
+                format!("literal \"{}\"", escaped)
+            } else {
+                format!("subpath \"{}\"", escaped)
+            };
+            caps.add_platform_rule(format!("(allow file-read-metadata ({}))", filter))?;
+            caps.add_platform_rule(format!("(deny file-read-data ({}))", filter))?;
+            caps.add_platform_rule(format!("(deny file-write* ({}))", filter))?;
+            // SECURITY: connect(2) on a Unix domain socket is enforced by Seatbelt as
+            // network-outbound, not as a file operation. File deny rules above have no
+            // effect on socket connections. Emit an exact-path network-outbound deny so
+            // that connecting to this path (e.g. a Docker daemon socket) is blocked even
+            // if the socket is created after the sandbox is applied. This rule is
+            // evaluated at syscall time, not at sandbox_init time, so it covers sockets
+            // that do not yet exist. For non-socket paths the rule is a harmless no-op.
+            // Use (path ...) not (subpath ...) — socket connections match on the exact
+            // path, not a prefix. Both symlink and canonical paths are covered because
+            // emit_deny_rules is called for each form by the caller.
+            caps.add_platform_rule(format!("(deny network-outbound (path \"{}\"))", escaped))?;
+            Ok(())
         };
 
-        caps.add_platform_rule(format!("(allow file-read-metadata ({}))", filter))?;
-        caps.add_platform_rule(format!("(deny file-read-data ({}))", filter))?;
-        caps.add_platform_rule(format!("(deny file-write* ({}))", filter))?;
+        // Emit deny rules for the original path
+        emit_deny_rules(&path, caps)?;
 
-        // Emit deny rules for the symlink target too
-        if let Some(ref resolved) = resolved {
-            if *resolved != path {
-                if let Ok(resolved_utf8) = path_to_utf8(resolved) {
-                    if let Ok(resolved_escaped) = escape_seatbelt_path(resolved_utf8) {
-                        let resolved_filter = if resolved.is_file() {
-                            format!("literal \"{}\"", resolved_escaped)
-                        } else {
-                            format!("subpath \"{}\"", resolved_escaped)
-                        };
-
-                        if let Err(e) = caps.add_platform_rule(format!(
-                            "(allow file-read-metadata ({}))",
-                            resolved_filter
-                        )) {
-                            warn!("Skipping symlink target deny metadata rule: {}", e);
-                        }
-                        if let Err(e) = caps.add_platform_rule(format!(
-                            "(deny file-read-data ({}))",
-                            resolved_filter
-                        )) {
-                            warn!("Skipping symlink target deny read rule: {}", e);
-                        }
-                        if let Err(e) = caps
-                            .add_platform_rule(format!("(deny file-write* ({}))", resolved_filter))
-                        {
-                            warn!("Skipping symlink target deny write rule: {}", e);
-                        }
-                    }
+        // Emit deny rules for the canonical path too (covers parent symlinks on existing paths)
+        if let Some(ref canonical) = canonical {
+            if *canonical != path {
+                if let Err(e) = emit_deny_rules(canonical, caps) {
+                    warn!(
+                        "Skipping canonical deny rules for {}: {}",
+                        canonical.display(),
+                        e
+                    );
                 }
+            }
+        }
+
+        // Emit deny rules for the parent-resolved path (covers non-existent paths
+        // whose parents contain symlinks, e.g. /var/run/future.sock -> /private/var/run/future.sock)
+        if let Some(ref resolved) = parent_resolved {
+            if let Err(e) = emit_deny_rules(resolved, caps) {
+                warn!(
+                    "Skipping parent-resolved deny rules for {}: {}",
+                    resolved.display(),
+                    e
+                );
             }
         }
     }
@@ -599,7 +666,7 @@ pub fn apply_macos_login_keychain_exception(caps: &mut CapabilitySet) {
 /// Apply deny overrides for specific paths, punching targeted holes through deny groups.
 ///
 /// For each override path:
-/// 1. Expands `~` and validates the path against `never_grant` (hard error if blocked)
+/// 1. Expands `~`
 /// 2. On macOS: emits Seatbelt allow rules more specific than the deny rules
 /// 3. Removes the path from `deny_paths` so Linux `validate_deny_overlaps` passes
 /// 4. Warns to stderr for each override applied (security relaxation must be visible)
@@ -610,43 +677,9 @@ pub fn apply_deny_overrides(
     overrides: &[std::path::PathBuf],
     deny_paths: &mut Vec<PathBuf>,
     caps: &mut CapabilitySet,
-    never_grant: &[String],
 ) -> Result<()> {
     if overrides.is_empty() {
         return Ok(());
-    }
-
-    // Expand and canonicalize never_grant paths for comparison.
-    // Expansion failures are fatal — a missing never_grant rule is a security bypass.
-    let mut never_grant_expanded: Vec<PathBuf> = Vec::with_capacity(never_grant.len());
-    for ng in never_grant {
-        let expanded = expand_path(ng).map_err(|e| {
-            NonoError::SandboxInit(format!(
-                "Failed to expand never_grant path '{}': {}. \
-                 Refusing to proceed — this could bypass security policy.",
-                ng, e
-            ))
-        })?;
-        // Canonicalize if the path exists to prevent symlink bypasses
-        // (e.g., override targets the canonical path while never_grant uses the symlink)
-        if expanded.exists() {
-            let canonical = expanded.canonicalize().map_err(|e| {
-                NonoError::SandboxInit(format!(
-                    "Failed to canonicalize never_grant path '{}': {}. \
-                     Refusing to proceed — this could bypass security policy.",
-                    expanded.display(),
-                    e
-                ))
-            })?;
-            // Keep both forms: canonical catches symlink bypasses,
-            // expanded catches non-canonical override paths
-            if canonical != expanded {
-                never_grant_expanded.push(expanded);
-            }
-            never_grant_expanded.push(canonical);
-        } else {
-            never_grant_expanded.push(expanded);
-        }
     }
 
     for override_path in overrides {
@@ -672,69 +705,90 @@ pub fn apply_deny_overrides(
             expanded.clone()
         };
 
-        // Check against never_grant (hard error)
-        // Both directions: override is child of never_grant (e.g., ~/.ssh/id_rsa/foo)
-        // AND override is ancestor of never_grant (e.g., ~/.ssh covering ~/.ssh/id_rsa)
-        for ng_path in &never_grant_expanded {
-            if canonical.starts_with(ng_path)
-                || expanded.starts_with(ng_path)
-                || ng_path.starts_with(&canonical)
-                || ng_path.starts_with(&expanded)
-            {
-                return Err(NonoError::SandboxInit(format!(
-                    "Cannot override deny for '{}': path overlaps the never_grant list (matched '{}'). \
-                     This path is blocked for security reasons and cannot be overridden.",
-                    override_path.display(),
-                    ng_path.display(),
-                )));
+        // Verify the override path is actually granted via explicit user intent
+        // (CLI flags or profile filesystem/policy config), not just covered by a
+        // system or group grant. Without this, a deny override under /tmp would
+        // silently pass because system_write_macos grants /var/folders, creating
+        // an unintended permission grant.
+        //
+        // Compute the union of access modes across ALL matching user-intent grants.
+        // This runs before deduplicate() which merges complementary Read + Write
+        // grants into ReadWrite, so we must aggregate here to avoid emitting
+        // Seatbelt allow rules for only the first grant's access mode.
+        let mut grant_has_read = false;
+        let mut grant_has_write = false;
+        for cap in caps.fs_capabilities() {
+            if !cap.source.is_user_intent() {
+                continue;
             }
-        }
-
-        // Verify the override path is actually granted via --allow/--read/--write.
-        // Without a grant, the deny removal is a no-op on Linux (Landlock is allow-list),
-        // but on macOS the Seatbelt allow rules below would implicitly grant access,
-        // creating a platform behavior divergence.
-        let is_granted = caps.fs_capabilities().iter().any(|cap| {
-            if cap.is_file {
+            let covers = if cap.is_file {
                 cap.resolved == canonical
             } else {
                 canonical.starts_with(&cap.resolved)
+            };
+            if covers {
+                match cap.access {
+                    AccessMode::Read => grant_has_read = true,
+                    AccessMode::Write => grant_has_write = true,
+                    AccessMode::ReadWrite => {
+                        grant_has_read = true;
+                        grant_has_write = true;
+                    }
+                }
             }
-        });
-        if !is_granted {
+        }
+        if !grant_has_read && !grant_has_write {
             return Err(NonoError::SandboxInit(format!(
-                "--override-deny '{}' has no matching grant. \
-                 Add --allow, --read, or --write for this path.",
+                "override_deny '{}' has no matching grant. \
+                 Add a filesystem allow (--allow, --read, --write, or profile filesystem/policy) \
+                 for this path.",
                 override_path.display(),
             )));
         }
 
         // Warn about the security relaxation
-        eprintln!(
-            "nono: warning: --override-deny relaxing deny rule for '{}'",
+        crate::output::print_warning(&format!(
+            "override_deny relaxing deny rule for '{}'",
             canonical.display()
-        );
+        ));
 
-        // On macOS: emit Seatbelt allow rules to punch through deny
+        // On macOS: emit Seatbelt allow rules to punch through deny.
+        // Only emit rules matching the effective access mode from the union
+        // of all covering grants to preserve least-privilege.
         if cfg!(target_os = "macos") {
-            let path_utf8 = path_to_utf8(&canonical)?;
-            let escaped = escape_seatbelt_path(path_utf8)?;
+            // Emit allow rules for both the canonical path and the original
+            // expanded path (if it differs, e.g. symlink). This mirrors
+            // add_deny_access_rules which denies both the symlink and target.
+            let mut override_paths = vec![canonical.clone()];
+            if expanded != canonical {
+                override_paths.push(expanded.clone());
+            }
 
-            let filter = if canonical.exists() && canonical.is_file() {
-                format!("literal \"{}\"", escaped)
-            } else {
-                format!("subpath \"{}\"", escaped)
-            };
+            for op in &override_paths {
+                let path_utf8 = path_to_utf8(op)?;
+                let escaped = escape_seatbelt_path(path_utf8)?;
 
-            // Allow read and write, overriding the deny rules
-            caps.add_platform_rule(format!("(allow file-read-data ({}))", filter))?;
-            caps.add_platform_rule(format!("(allow file-write* ({}))", filter))?;
+                let filter = if op.exists() && op.is_file() {
+                    format!("literal \"{}\"", escaped)
+                } else {
+                    format!("subpath \"{}\"", escaped)
+                };
+
+                if grant_has_read {
+                    caps.add_platform_rule(format!("(allow file-read-data ({}))", filter))?;
+                }
+                if grant_has_write {
+                    caps.add_platform_rule(format!("(allow file-write* ({}))", filter))?;
+                }
+            }
         }
 
         // Remove deny entries that the override covers (equal or child of the override path).
-        // Do NOT remove broader deny entries when the override is a child — e.g., overriding
-        // ~/.aws must not remove a deny on the entire home directory.
-        deny_paths.retain(|dp| !dp.starts_with(&canonical));
+        // Check both the canonical and expanded (symlink) forms so that deny entries
+        // recorded for either the symlink or its target are removed.
+        // Do NOT remove broader deny entries when the override is a child — e.g.,
+        // overriding ~/.aws must not remove a deny on the entire home directory.
+        deny_paths.retain(|dp| !dp.starts_with(&canonical) && !dp.starts_with(&expanded));
     }
 
     Ok(())
@@ -966,12 +1020,12 @@ pub fn get_system_read_paths(policy: &Policy) -> Vec<String> {
     result
 }
 
-/// Validate that trust_groups does not attempt to remove any required groups.
+/// Validate that a group exclusion list does not attempt to remove required groups.
 ///
 /// Required groups have `required: true` in policy.json and cannot be excluded
 /// by profiles or user configuration. Returns an error listing all violations.
-pub fn validate_trust_groups(policy: &Policy, trust_groups: &[String]) -> Result<()> {
-    let violations: Vec<&String> = trust_groups
+pub fn validate_group_exclusions(policy: &Policy, excluded_groups: &[String]) -> Result<()> {
+    let violations: Vec<&String> = excluded_groups
         .iter()
         .filter(|name| policy.groups.get(name.as_str()).is_some_and(|g| g.required))
         .collect();
@@ -987,19 +1041,9 @@ pub fn validate_trust_groups(policy: &Policy, trust_groups: &[String]) -> Result
         .join(", ");
 
     Err(NonoError::ConfigParse(format!(
-        "Cannot exclude required groups via trust_groups: {}",
+        "Cannot exclude required groups: {}",
         names
     )))
-}
-
-/// Common deny + system groups shared by all sandbox invocations.
-///
-/// Reads from the embedded policy.json `base_groups` array. This is the base
-/// set of groups that both `from_args()` (non-profile CLI) and built-in
-/// profiles use. Profiles extend this with additional groups.
-pub fn base_groups() -> Result<Vec<String>> {
-    let policy = load_embedded_policy()?;
-    Ok(policy.base_groups)
 }
 
 /// Get a built-in profile from embedded policy.json.
@@ -1008,7 +1052,9 @@ pub fn base_groups() -> Result<Vec<String>> {
 pub fn get_policy_profile(name: &str) -> Result<Option<profile::Profile>> {
     let policy = load_embedded_policy()?;
     match policy.profiles.get(name) {
-        Some(def) => Ok(Some(def.to_profile(&policy.base_groups, &policy)?)),
+        Some(def) => Ok(Some(crate::profile::resolve_and_finalize_profile(
+            def.to_raw_profile(),
+        )?)),
         None => Ok(None),
     }
 }
@@ -1376,10 +1422,11 @@ mod tests {
         if cfg!(target_os = "macos") {
             // On macOS, Seatbelt platform rules should be generated
             let rules = caps.platform_rules();
-            assert_eq!(rules.len(), 3);
+            assert_eq!(rules.len(), 4);
             assert!(rules[0].contains("allow file-read-metadata"));
             assert!(rules[1].contains("deny file-read-data"));
             assert!(rules[2].contains("deny file-write*"));
+            assert!(rules[3].contains("deny network-outbound"));
         } else {
             // On Linux, no platform rules generated (Landlock has no deny semantics)
             assert!(caps.platform_rules().is_empty());
@@ -1413,18 +1460,25 @@ mod tests {
         );
 
         if cfg!(target_os = "macos") {
-            // Should have 6 rules: 3 for symlink path + 3 for resolved target
+            // Should have 8 rules: 4 for symlink path + 4 for resolved target
             let rules = caps.platform_rules();
-            assert_eq!(rules.len(), 6, "expected 6 Seatbelt rules for symlink deny");
+            assert_eq!(rules.len(), 8, "expected 8 Seatbelt rules for symlink deny");
         }
     }
 
     #[test]
     fn test_deny_access_non_symlink_no_duplicate() {
-        // A regular (non-symlink) file should only produce one deny_paths entry
+        // A regular (non-symlink) file whose parents also resolve to the same
+        // canonical path should produce one deny_paths entry. On macOS tempdir
+        // lives under /var/folders (symlink to /private/var/folders), so the
+        // canonical and original paths differ — that's two entries, which is
+        // correct because Seatbelt needs both forms.
         let dir = tempfile::tempdir().expect("create tempdir");
         let file = dir.path().join("regular_file");
         std::fs::write(&file, "content").expect("write file");
+
+        let canonical = file.canonicalize().expect("canonicalize");
+        let parent_is_symlinked = canonical != file;
 
         let mut caps = CapabilitySet::new();
         let mut deny_paths = Vec::new();
@@ -1432,11 +1486,126 @@ mod tests {
         add_deny_access_rules(file_str, &mut caps, &mut deny_paths)
             .expect("add deny rules for regular file");
 
+        let expected = if parent_is_symlinked { 2 } else { 1 };
         assert_eq!(
             deny_paths.len(),
-            1,
-            "regular file should have one deny_paths entry"
+            expected,
+            "deny_paths entries: expected {} (parent symlinked: {}), got {:?}",
+            expected,
+            parent_is_symlinked,
+            deny_paths
         );
+    }
+
+    #[test]
+    fn test_resolve_parent_symlinks_nonexistent_leaf() {
+        // Create a dir with a symlinked parent, then ask for a non-existent
+        // child inside it. resolve_parent_symlinks should give back the
+        // canonical form with the leaf appended.
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        // Build: dir/real_dir/  and  dir/link_dir -> real_dir
+        let real_dir = dir.path().join("real_dir");
+        std::fs::create_dir(&real_dir).expect("create real_dir");
+        let link_dir = dir.path().join("link_dir");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).expect("create symlink");
+
+        // The leaf (future.sock) does not exist yet
+        let future = link_dir.join("future.sock");
+        assert!(!future.exists(), "test precondition: leaf must not exist");
+
+        let result = resolve_parent_symlinks(&future).expect("resolve_parent_symlinks");
+
+        // The real_dir canonical path must be used as the parent
+        let real_dir_canonical = real_dir.canonicalize().expect("canonicalize real_dir");
+        let expected = real_dir_canonical.join("future.sock");
+
+        // Only returns Some when the resolved path differs from the original
+        if link_dir.canonicalize().ok().as_deref() != Some(&*real_dir_canonical)
+            || link_dir != real_dir
+        {
+            assert_eq!(result, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_resolve_parent_symlinks_existing_path() {
+        // When the full path already exists, resolve_parent_symlinks returns
+        // None if it equals the original (no parent symlinks), or Some if
+        // parent symlinks make it differ — consistent with canonicalize().
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file = dir.path().join("existing.txt");
+        std::fs::write(&file, "content").expect("write file");
+
+        let result = resolve_parent_symlinks(&file).expect("resolve_parent_symlinks");
+        let canonical = file.canonicalize().expect("canonicalize");
+        if canonical == file {
+            assert_eq!(result, None, "no parent symlinks means None");
+        } else {
+            assert_eq!(
+                result,
+                Some(canonical),
+                "parent symlinks means Some(canonical)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deny_access_nonexistent_under_symlinked_parent() {
+        // Simulate /var/run/future.sock on macOS: the leaf doesn't exist yet
+        // but the parent directory contains a symlink. Both the original and
+        // the parent-resolved path should appear in deny_paths, and on macOS
+        // both should get Seatbelt rules (4 rules each = 8 total).
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let real_dir = dir.path().join("real_run");
+        std::fs::create_dir(&real_dir).expect("create real_run");
+        let link_dir = dir.path().join("run");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).expect("create symlink");
+
+        let socket_path = link_dir.join("daemon.sock");
+        assert!(
+            !socket_path.exists(),
+            "test precondition: socket must not exist"
+        );
+
+        let mut caps = CapabilitySet::new();
+        let mut deny_paths = Vec::new();
+        let path_str = socket_path.to_str().expect("valid utf8");
+        add_deny_access_rules(path_str, &mut caps, &mut deny_paths)
+            .expect("add deny rules for non-existent socket under symlinked parent");
+
+        let real_dir_canonical = real_dir.canonicalize().expect("canonicalize real_dir");
+        let resolved_socket = real_dir_canonical.join("daemon.sock");
+
+        let parent_is_symlinked = link_dir.canonicalize().ok().as_deref()
+            != Some(&*real_dir_canonical)
+            || link_dir != real_dir;
+
+        if parent_is_symlinked && resolved_socket != socket_path {
+            assert!(
+                deny_paths.contains(&socket_path.to_path_buf()),
+                "deny_paths must contain the original path"
+            );
+            assert!(
+                deny_paths.contains(&resolved_socket),
+                "deny_paths must contain the parent-resolved path; got {:?}",
+                deny_paths
+            );
+
+            if cfg!(target_os = "macos") {
+                let rules = caps.platform_rules();
+                assert_eq!(
+                    rules.len(),
+                    8,
+                    "expected 8 Seatbelt rules (4 original + 4 resolved); got: {:?}",
+                    rules
+                );
+            }
+        } else {
+            // Parent was not actually a symlink (unlikely in this test but safe to handle)
+            assert!(deny_paths.contains(&socket_path.to_path_buf()));
+        }
     }
 
     #[test]
@@ -1622,7 +1791,7 @@ mod tests {
         // under an allowed subtree, and allowing + denying the same directory
         // means the allow wins. Both cases silently disable the deny.
         //
-        // We check every group (not just base_groups) because profiles can
+        // We check every group because profiles can
         // combine arbitrary groups, and validate_deny_overlaps is warn-only
         // for group-sourced capabilities at runtime. This test is the real
         // safety net for the embedded policy.
@@ -1677,7 +1846,7 @@ mod tests {
                     "Deny-within-allow overlap on Linux: deny '{}' (group: {}) \
                      is under or equal to allowed '{}' (group: {}). Landlock \
                      cannot enforce this. Narrow the allow path or move the \
-                     deny to never_grant.",
+                     deny into a separate explicit grant path.",
                     deny_path.display(),
                     deny_group,
                     allow_path.display(),
@@ -1706,16 +1875,16 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_trust_groups_allows_non_required() {
+    fn test_validate_group_exclusions_allows_non_required() {
         let policy = load_policy(sample_policy_json()).expect("parse failed");
-        let result = validate_trust_groups(&policy, &["test_read".to_string()]);
+        let result = validate_group_exclusions(&policy, &["test_read".to_string()]);
         assert!(result.is_ok(), "Non-required group should be removable");
     }
 
     #[test]
-    fn test_validate_trust_groups_rejects_required() {
+    fn test_validate_group_exclusions_rejects_required() {
         let policy = load_policy(sample_policy_json()).expect("parse failed");
-        let result = validate_trust_groups(&policy, &["test_required".to_string()]);
+        let result = validate_group_exclusions(&policy, &["test_required".to_string()]);
         assert!(result.is_err(), "Required group must not be removable");
         let err = result.expect_err("expected error");
         assert!(
@@ -1726,12 +1895,31 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_trust_groups_ignores_unknown() {
+    fn test_validate_group_exclusions_ignores_unknown() {
         let policy = load_policy(sample_policy_json()).expect("parse failed");
-        let result = validate_trust_groups(&policy, &["nonexistent_group".to_string()]);
+        let result = validate_group_exclusions(&policy, &["nonexistent_group".to_string()]);
         assert!(
             result.is_ok(),
             "Unknown groups should not trigger required check"
+        );
+    }
+
+    #[test]
+    fn test_profile_def_to_raw_profile_combines_exclude_groups() {
+        let def = ProfileDef {
+            exclude_groups: vec!["preferred".to_string()],
+            policy: profile::PolicyPatchConfig {
+                exclude_groups: vec!["policy".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let raw = def.to_raw_profile();
+
+        assert_eq!(
+            raw.policy.exclude_groups,
+            vec!["preferred".to_string(), "policy".to_string()]
         );
     }
 
@@ -1817,6 +2005,31 @@ mod tests {
     }
 
     #[test]
+    fn test_system_read_linux_does_not_grant_bare_etc_or_proc() {
+        let policy = load_embedded_policy().expect("embedded policy must parse");
+        let group = policy
+            .groups
+            .get("system_read_linux")
+            .expect("system_read_linux group must exist");
+        let read_paths = group
+            .allow
+            .as_ref()
+            .map(|a| a.read.as_slice())
+            .unwrap_or(&[]);
+
+        assert!(
+            !read_paths.iter().any(|p| p == "/etc"),
+            "system_read_linux must not grant bare '/etc'; use specific paths instead. Found: {:?}",
+            read_paths
+        );
+        assert!(
+            !read_paths.iter().any(|p| p == "/proc"),
+            "system_read_linux must not grant bare '/proc'; use specific paths instead. Found: {:?}",
+            read_paths
+        );
+    }
+
+    #[test]
     fn test_apply_deny_overrides_removes_from_deny_paths() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let denied = dir.path().join("denied");
@@ -1830,84 +2043,20 @@ mod tests {
         let mut deny_paths = vec![denied_canonical.clone(), other_canonical.clone()];
         let mut caps = CapabilitySet::new();
         caps.add_fs(FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("grant dir"));
-        let never_grant: Vec<String> = vec![];
-
         let overrides = vec![denied.clone()];
 
-        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps, &never_grant)
-            .expect("should succeed");
+        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps).expect("should succeed");
 
         assert_eq!(deny_paths.len(), 1);
         assert_eq!(deny_paths[0], other_canonical);
     }
 
     #[test]
-    fn test_apply_deny_overrides_rejects_never_grant() {
-        let mut deny_paths = vec![];
-        let mut caps = CapabilitySet::new();
-        let never_grant = vec!["~/.ssh/id_rsa".to_string()];
-
-        let home = std::env::var("HOME").expect("HOME must be set");
-        let overrides = vec![PathBuf::from(format!("{}/.ssh/id_rsa", home))];
-
-        let result = apply_deny_overrides(&overrides, &mut deny_paths, &mut caps, &never_grant);
-        assert!(result.is_err());
-        let err = result.expect_err("expected error");
-        assert!(
-            err.to_string().contains("never_grant"),
-            "error should mention never_grant, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_apply_deny_overrides_rejects_never_grant_child() {
-        let mut deny_paths = vec![];
-        let mut caps = CapabilitySet::new();
-        let never_grant = vec!["~/.gnupg".to_string()];
-
-        let home = std::env::var("HOME").expect("HOME must be set");
-        // A child of a never_grant path should also be blocked
-        let overrides = vec![PathBuf::from(format!("{}/.gnupg/private-keys-v1.d", home))];
-
-        let result = apply_deny_overrides(&overrides, &mut deny_paths, &mut caps, &never_grant);
-        assert!(result.is_err());
-        let err = result.expect_err("expected error");
-        assert!(
-            err.to_string().contains("never_grant"),
-            "error should mention never_grant, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_apply_deny_overrides_rejects_never_grant_ancestor() {
-        let mut deny_paths = vec![];
-        let mut caps = CapabilitySet::new();
-        let never_grant = vec!["~/.ssh/id_rsa".to_string(), "~/.ssh/id_ed25519".to_string()];
-
-        let home = std::env::var("HOME").expect("HOME must be set");
-        // An ancestor of a never_grant path should also be blocked —
-        // a subpath allow on ~/.ssh would expose ~/.ssh/id_rsa
-        let overrides = vec![PathBuf::from(format!("{}/.ssh", home))];
-
-        let result = apply_deny_overrides(&overrides, &mut deny_paths, &mut caps, &never_grant);
-        assert!(result.is_err());
-        let err = result.expect_err("expected error");
-        assert!(
-            err.to_string().contains("never_grant"),
-            "error should mention never_grant, got: {}",
-            err
-        );
-    }
-
-    #[test]
     fn test_apply_deny_overrides_empty_is_noop() {
         let mut deny_paths = vec![PathBuf::from("/tmp/denied")];
         let mut caps = CapabilitySet::new();
-        let never_grant: Vec<String> = vec![];
 
-        apply_deny_overrides(&[], &mut deny_paths, &mut caps, &never_grant)
+        apply_deny_overrides(&[], &mut deny_paths, &mut caps)
             .expect("empty overrides should succeed");
 
         assert_eq!(deny_paths.len(), 1, "deny_paths should be unchanged");
@@ -1922,12 +2071,9 @@ mod tests {
         caps.add_fs(
             FsCapability::new_dir(Path::new("/tmp"), AccessMode::ReadWrite).expect("grant /tmp"),
         );
-        let never_grant: Vec<String> = vec![];
-
         let overrides = vec![PathBuf::from("/tmp")];
 
-        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps, &never_grant)
-            .expect("should succeed");
+        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps).expect("should succeed");
 
         let rules = caps.platform_rules().join("\n");
         assert!(
@@ -1948,6 +2094,94 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_deny_overrides_respects_read_only_grant() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let denied = dir.path().join("readonly");
+        std::fs::create_dir_all(&denied).expect("mkdir");
+
+        let denied_canonical = denied.canonicalize().expect("canonicalize");
+        let mut deny_paths = vec![denied_canonical];
+        let mut caps = CapabilitySet::new();
+        // Grant read-only access
+        caps.add_fs(FsCapability::new_dir(&denied, AccessMode::Read).expect("grant"));
+        let overrides = vec![denied];
+
+        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps).expect("should succeed");
+
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            rules.contains("allow file-read-data"),
+            "should emit read rule for read-only grant, got: {}",
+            rules
+        );
+        assert!(
+            !rules.contains("allow file-write*"),
+            "must NOT emit write rule for read-only grant, got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_deny_overrides_respects_write_only_grant() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let denied = dir.path().join("writeonly");
+        std::fs::create_dir_all(&denied).expect("mkdir");
+
+        let denied_canonical = denied.canonicalize().expect("canonicalize");
+        let mut deny_paths = vec![denied_canonical];
+        let mut caps = CapabilitySet::new();
+        // Grant write-only access
+        caps.add_fs(FsCapability::new_dir(&denied, AccessMode::Write).expect("grant"));
+        let overrides = vec![denied];
+
+        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps).expect("should succeed");
+
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            !rules.contains("allow file-read-data"),
+            "must NOT emit read rule for write-only grant, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains("allow file-write*"),
+            "should emit write rule for write-only grant, got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_deny_overrides_merges_complementary_read_write_grants() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let denied = dir.path().join("merged_rw");
+        std::fs::create_dir_all(&denied).expect("mkdir");
+
+        let denied_canonical = denied.canonicalize().expect("canonicalize");
+        let mut deny_paths = vec![denied_canonical];
+        let mut caps = CapabilitySet::new();
+        // Two separate grants: Read and Write (not yet deduplicated)
+        caps.add_fs(FsCapability::new_dir(&denied, AccessMode::Read).expect("read grant"));
+        caps.add_fs(FsCapability::new_dir(&denied, AccessMode::Write).expect("write grant"));
+        let overrides = vec![denied];
+
+        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps).expect("should succeed");
+
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            rules.contains("allow file-read-data"),
+            "should emit read rule from merged Read+Write grants, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains("allow file-write*"),
+            "should emit write rule from merged Read+Write grants, got: {}",
+            rules
+        );
+    }
+
     #[test]
     fn test_apply_deny_overrides_does_not_remove_broader_deny() {
         // Overriding a child path must NOT remove a broader parent deny.
@@ -1961,12 +2195,9 @@ mod tests {
         let mut deny_paths = vec![dir_canonical.clone(), sub_canonical.clone()];
         let mut caps = CapabilitySet::new();
         caps.add_fs(FsCapability::new_dir(&sub, AccessMode::ReadWrite).expect("grant sub"));
-        let never_grant: Vec<String> = vec![];
-
         let overrides = vec![sub.clone()];
 
-        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps, &never_grant)
-            .expect("should succeed");
+        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps).expect("should succeed");
 
         // sub should be removed, but parent dir must remain
         assert_eq!(deny_paths.len(), 1);
@@ -1983,17 +2214,68 @@ mod tests {
         let mut deny_paths = vec![denied_canonical];
         let mut caps = CapabilitySet::new();
         // No grant added — override should fail
-        let never_grant: Vec<String> = vec![];
-
         let overrides = vec![denied];
 
-        let result = apply_deny_overrides(&overrides, &mut deny_paths, &mut caps, &never_grant);
+        let result = apply_deny_overrides(&overrides, &mut deny_paths, &mut caps);
         assert!(result.is_err());
         let err = result.expect_err("expected error");
         assert!(
             err.to_string().contains("no matching grant"),
             "error should mention missing grant, got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_apply_deny_overrides_rejects_group_sourced_grant() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let denied = dir.path().join("group_granted");
+        std::fs::create_dir_all(&denied).expect("mkdir");
+
+        let denied_canonical = denied.canonicalize().expect("canonicalize");
+        let mut deny_paths = vec![denied_canonical];
+        let mut caps = CapabilitySet::new();
+        // Add a group-sourced grant (not user intent)
+        let mut cap = FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("grant");
+        cap.source = CapabilitySource::Group("system_write".to_string());
+        caps.add_fs(cap);
+        let overrides = vec![denied];
+
+        let result = apply_deny_overrides(&overrides, &mut deny_paths, &mut caps);
+        assert!(result.is_err());
+        let err = result.expect_err("expected error");
+        assert!(
+            err.to_string().contains("no matching grant"),
+            "group grant should not satisfy override_deny, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_apply_deny_overrides_removes_symlink_and_target_deny_paths() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let target = dir.path().join("real_dir");
+        std::fs::create_dir_all(&target).expect("mkdir target");
+        let link = dir.path().join("link_dir");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let target_canonical = target.canonicalize().expect("canonicalize target");
+        let link_expanded = link.clone();
+
+        // add_deny_access_rules records both the symlink path and the resolved target
+        let mut deny_paths = vec![link_expanded.clone(), target_canonical.clone()];
+        let mut caps = CapabilitySet::new();
+        // Grant via the target (which is what profile filesystem grants canonicalize to)
+        caps.add_fs(FsCapability::new_dir(&target, AccessMode::ReadWrite).expect("grant"));
+        // Override via the symlink path (what the user writes in their profile)
+        let overrides = vec![link];
+
+        apply_deny_overrides(&overrides, &mut deny_paths, &mut caps).expect("should succeed");
+
+        assert!(
+            deny_paths.is_empty(),
+            "both symlink and target deny paths should be removed, remaining: {:?}",
+            deny_paths
         );
     }
 }

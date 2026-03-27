@@ -26,9 +26,6 @@ impl SetupRunner {
     }
 
     pub fn run(&self) -> Result<()> {
-        // Print ASCII art banner with random quote
-        self.print_banner();
-
         // Installation verification
         self.check_installation()?;
 
@@ -57,31 +54,6 @@ impl SetupRunner {
         self.show_summary();
 
         Ok(())
-    }
-
-    fn print_banner(&self) {
-        // ASCII art with random motivational quote
-        let quotes = [
-            "Don't YOLO when you can NONO!",
-            "Security first, sandbox always!",
-            "Trust but verify!",
-            "Kernel-level security for user-level peace!",
-            "Capability-based security FTW!",
-            "Sandbox all the things!",
-            "Zero trust, maximum safety!",
-        ];
-
-        // Use simple deterministic selection based on timestamp
-        // to avoid needing rand dependency
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let quote = quotes[(now as usize) % quotes.len()];
-
-        println!(" ▄▀▄      nono v{}", env!("CARGO_PKG_VERSION"));
-        println!("▀▄█▄▀    - {}", quote);
-        println!();
     }
 
     fn check_installation(&self) -> Result<()> {
@@ -201,26 +173,19 @@ impl SetupRunner {
             println!("  * Kernel version: {}", version);
         }
 
-        // Check LSM list
-        let lsm_list = std::fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default();
-
-        if !lsm_list.contains("landlock") {
-            return Err(NonoError::Setup(
-                "Landlock is not enabled in kernel LSM list.\n\n\
+        // Check Landlock support via syscall probe
+        let detected = nono::Sandbox::detect_abi()
+            .map_err(|e| NonoError::Setup(format!(
+                "Landlock is not available: {}\n\n\
                 To enable Landlock:\n\
                   1. Check your kernel config: CONFIG_SECURITY_LANDLOCK=y\n\
                   2. Add to boot params: lsm=landlock,lockdown,yama,integrity,apparmor\n\
                   3. Reboot your system\n\n\
-                See: https://github.com/always-further/nono/docs/troubleshooting.md#landlock-not-supported"
-                    .to_string(),
-            ));
-        }
+                See: https://github.com/always-further/nono/docs/troubleshooting.md#landlock-not-supported",
+                e
+            )))?;
 
-        println!("  * Landlock enabled in LSM list");
-
-        // Use the library's detect_abi() instead of local probing
-        let detected = nono::Sandbox::detect_abi()
-            .map_err(|e| NonoError::Setup(format!("Failed to detect Landlock ABI: {}", e)))?;
+        println!("  * Landlock enabled (syscall probe)");
 
         println!("  * {}", detected);
         println!("  * Available features:");
@@ -238,7 +203,16 @@ impl SetupRunner {
                 println!("  * TCP network filtering: probe failed despite ABI support");
             }
         } else {
-            println!("  * TCP network filtering: not supported by this ABI");
+            match nono::sandbox::probe_seccomp_block_network_support()? {
+                true => println!(
+                    "  * TCP network filtering: not supported by this ABI \
+                     (seccomp fallback available: full --block-net and --proxy-only modes)"
+                ),
+                false => println!(
+                    "  * TCP network filtering: not supported by this ABI \
+                     (seccomp fallback is not available on this system)"
+                ),
+            }
         }
 
         Ok(())

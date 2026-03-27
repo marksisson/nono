@@ -22,12 +22,13 @@ use nix::unistd::{fork, ForkResult, Pid};
 use nono::supervisor::{ApprovalDecision, SupervisorMessage, SupervisorResponse};
 use nono::{
     ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, DiagnosticFormatter,
-    DiagnosticMode, NeverGrantChecker, NonoError, Result, Sandbox, SupervisorSocket,
+    DiagnosticMode, NonoError, Result, Sandbox, SupervisorSocket,
 };
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -172,6 +173,8 @@ pub struct ExecConfig<'a> {
     pub env_vars: Vec<(&'a str, &'a str)>,
     /// Path to the capability state file.
     pub cap_file: &'a std::path::Path,
+    /// Directory the child process should start in.
+    pub current_dir: &'a std::path::Path,
     /// Whether to suppress diagnostic output.
     pub no_diagnostics: bool,
     /// Threading context for fork safety validation.
@@ -183,6 +186,13 @@ pub struct ExecConfig<'a> {
     /// a PTY mux for terminal isolation during approval prompts.
     /// When false, the child runs with static capabilities only.
     pub capability_elevation: bool,
+    /// Whether the seccomp proxy-only network fallback is needed.
+    /// Set by the parent before fork when Landlock ABI lacks AccessNet
+    /// and ProxyOnly network mode is requested. Both child and parent
+    /// use this flag to coordinate: child installs the proxy filter and
+    /// sends the notify fd; parent expects to receive it.
+    #[cfg(target_os = "linux")]
+    pub seccomp_proxy_fallback: bool,
 }
 
 /// Configuration for supervisor IPC in supervised execution mode.
@@ -193,8 +203,8 @@ pub struct ExecConfig<'a> {
 /// in the parent that handles capability expansion requests from the
 /// sandboxed child.
 pub struct SupervisorConfig<'a> {
-    /// Checker for permanently blocked paths (from policy.json `never_grant`)
-    pub never_grant: &'a NeverGrantChecker,
+    /// Protected nono state roots that must never be granted dynamically.
+    pub protected_roots: &'a [std::path::PathBuf],
     /// Backend for approval decisions (terminal prompt, webhook, policy engine)
     pub approval_backend: &'a dyn ApprovalBackend,
     /// Session identifier used for audit correlation.
@@ -204,6 +214,20 @@ pub struct SupervisorConfig<'a> {
     pub open_url_origins: &'a [String],
     /// Whether to allow http://localhost and http://127.0.0.1 URLs.
     pub open_url_allow_localhost: bool,
+    /// Whether direct LaunchServices opening is enabled for this session.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub allow_launch_services_active: bool,
+    /// Proxy port allowed for seccomp proxy-only fallback (0 = not active).
+    #[cfg(target_os = "linux")]
+    pub proxy_port: u16,
+    /// Bind ports allowed for seccomp proxy-only fallback.
+    #[cfg(target_os = "linux")]
+    pub proxy_bind_ports: Vec<u16>,
+}
+
+#[cfg(target_os = "macos")]
+fn should_install_macos_open_shim(supervisor: Option<&SupervisorConfig<'_>>) -> bool {
+    supervisor.is_some_and(|cfg| !cfg.allow_launch_services_active)
 }
 
 /// Execute a command using the Direct strategy (exec, nono disappears).
@@ -221,6 +245,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 
     let mut cmd = Command::new(config.resolved_program);
     cmd.env_clear();
+    cmd.current_dir(config.current_dir);
 
     for (key, value) in std::env::vars() {
         if !should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
@@ -288,6 +313,8 @@ pub fn execute_supervised(
     // Convert program path to CString for execve
     let program_c = CString::new(program_path.to_string_lossy().as_bytes())
         .map_err(|_| NonoError::SandboxInit("Program path contains null byte".to_string()))?;
+    let current_dir_c = CString::new(config.current_dir.as_os_str().as_bytes())
+        .map_err(|_| NonoError::SandboxInit("Working directory contains null byte".to_string()))?;
 
     // Build argv: [program, args..., NULL]
     let mut argv_c: Vec<CString> = Vec::with_capacity(1 + cmd_args.len());
@@ -378,25 +405,27 @@ pub fn execute_supervised(
 
             #[cfg(target_os = "macos")]
             {
-                // Create a shim `open` script that delegates to nono open-url-helper.
-                // The npm `open` package spawns `open <url>` on macOS; by placing our
-                // shim earlier in PATH, we intercept the call.
-                if let Some(shim) = create_open_shim(&nono_exe) {
-                    // Prepend shim dir to PATH and also set BROWSER for any tool
-                    // that does respect it.
-                    let current_path = std::env::var("PATH").unwrap_or_default();
-                    let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
-                    if let Ok(cstr) = CString::new(new_path) {
-                        // Remove existing PATH from env_c, then add our modified one
-                        env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
-                        env_c.push(cstr);
+                if should_install_macos_open_shim(supervisor) {
+                    // Create a shim `open` script that delegates to nono open-url-helper.
+                    // The npm `open` package spawns `open <url>` on macOS; by placing our
+                    // shim earlier in PATH, we intercept the call.
+                    if let Some(shim) = create_open_shim(&nono_exe) {
+                        // Prepend shim dir to PATH and also set BROWSER for any tool
+                        // that does respect it.
+                        let current_path = std::env::var("PATH").unwrap_or_default();
+                        let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
+                        if let Ok(cstr) = CString::new(new_path) {
+                            // Remove existing PATH from env_c, then add our modified one
+                            env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
+                            env_c.push(cstr);
+                        }
+                        let quoted_helper = shell_quote(&shim.helper_exe.display().to_string());
+                        let browser_cmd = format!("BROWSER={quoted_helper} open-url-helper");
+                        if let Ok(cstr) = CString::new(browser_cmd) {
+                            env_c.push(cstr);
+                        }
+                        open_shim = Some(shim);
                     }
-                    let quoted_helper = shell_quote(&shim.helper_exe.display().to_string());
-                    let browser_cmd = format!("BROWSER={quoted_helper} open-url-helper");
-                    if let Ok(cstr) = CString::new(browser_cmd) {
-                        env_c.push(cstr);
-                    }
-                    open_shim = Some(shim);
                 }
             }
         }
@@ -547,16 +576,40 @@ pub fn execute_supervised(
             // for rule creation, so it must run before seccomp-notify is installed.
             // (seccomp-notify traps ALL openat/openat2 syscalls, which would
             // intercept Landlock's own path opens and deadlock.)
-            if let Err(e) = Sandbox::apply(effective_caps) {
-                let detail = format!("nono: failed to apply sandbox in supervised child: {}\n", e);
-                let msg = detail.as_bytes();
-                unsafe {
-                    libc::write(
-                        libc::STDERR_FILENO,
-                        msg.as_ptr().cast::<libc::c_void>(),
-                        msg.len(),
-                    );
-                    libc::_exit(126);
+            #[cfg(target_os = "linux")]
+            {
+                match Sandbox::apply(effective_caps) {
+                    Ok(_fallback) => {}
+                    Err(e) => {
+                        let detail =
+                            format!("nono: failed to apply sandbox in supervised child: {}\n", e);
+                        let msg = detail.as_bytes();
+                        unsafe {
+                            libc::write(
+                                libc::STDERR_FILENO,
+                                msg.as_ptr().cast::<libc::c_void>(),
+                                msg.len(),
+                            );
+                            libc::_exit(126);
+                        }
+                    }
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                if let Err(e) = Sandbox::apply(effective_caps) {
+                    let detail =
+                        format!("nono: failed to apply sandbox in supervised child: {}\n", e);
+                    let msg = detail.as_bytes();
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                        libc::_exit(126);
+                    }
                 }
             }
 
@@ -612,16 +665,65 @@ pub fn execute_supervised(
                         }
                     }
                 }
+
+                // If the parent determined that seccomp proxy fallback is needed
+                // (Landlock ABI lacks AccessNet + ProxyOnly mode), install the
+                // proxy filter and send its notify fd to the parent.
+                if config.seccomp_proxy_fallback {
+                    let has_bind = match effective_caps.network_mode() {
+                        nono::NetworkMode::ProxyOnly { bind_ports, .. } => !bind_ports.is_empty(),
+                        _ => false,
+                    };
+                    if let Some(fd) = child_sock_fd {
+                        match nono::sandbox::install_seccomp_proxy_filter(has_bind) {
+                            Ok(proxy_notify_fd) => {
+                                let child_sock =
+                                    unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+                                let tmp_sock = SupervisorSocket::from_stream(child_sock);
+                                if let Err(e) = tmp_sock.send_fd(proxy_notify_fd.as_raw_fd()) {
+                                    let detail = format!(
+                                        "nono: failed to send proxy seccomp notify fd: {}\n",
+                                        e
+                                    );
+                                    let msg = detail.as_bytes();
+                                    unsafe {
+                                        libc::write(
+                                            libc::STDERR_FILENO,
+                                            msg.as_ptr().cast::<libc::c_void>(),
+                                            msg.len(),
+                                        );
+                                        libc::_exit(126);
+                                    }
+                                }
+                                std::mem::forget(tmp_sock);
+                            }
+                            Err(e) => {
+                                let detail =
+                                    format!("nono: seccomp proxy filter not available: {}\n", e);
+                                let msg = detail.as_bytes();
+                                unsafe {
+                                    libc::write(
+                                        libc::STDERR_FILENO,
+                                        msg.as_ptr().cast::<libc::c_void>(),
+                                        msg.len(),
+                                    );
+                                    libc::_exit(126);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            // When capability elevation is off, make the child non-dumpable
-            // to prevent ptrace attachment from same-UID processes. When
-            // elevation is active, the child must stay dumpable so the parent
-            // can read /proc/CHILD/mem for seccomp-notify path extraction.
+            // When capability elevation is off AND no seccomp proxy fallback
+            // is active, make the child non-dumpable to prevent ptrace
+            // attachment from same-UID processes. When either is active,
+            // the child must stay dumpable so the parent can read
+            // /proc/CHILD/mem for seccomp-notify path/sockaddr extraction.
             #[cfg(target_os = "linux")]
             {
-                if !config.capability_elevation {
-                    // No supervisor IPC — safe to drop dumpable
+                if !config.capability_elevation && !config.seccomp_proxy_fallback {
+                    // No supervisor needs /proc/CHILD/mem — safe to drop dumpable
                     unsafe {
                         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
                     }
@@ -638,6 +740,23 @@ pub fn execute_supervised(
 
             // Close inherited FDs (but keep stdin/stdout/stderr and supervisor socket)
             close_inherited_fds(max_fd, &child_keep_fds);
+
+            // SAFETY: `current_dir_c` was prepared before fork and remains valid
+            // for the lifetime of the child. `chdir` is async-signal-safe.
+            let chdir_result = unsafe { libc::chdir(current_dir_c.as_ptr()) };
+            if chdir_result != 0 {
+                const MSG: &[u8] = b"nono: failed to enter child working directory\n";
+                // SAFETY: `write` and `_exit` are async-signal-safe and we're in
+                // the post-fork child path where higher-level Rust APIs are unsafe.
+                unsafe {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        MSG.as_ptr().cast::<libc::c_void>(),
+                        MSG.len(),
+                    );
+                    libc::_exit(126);
+                }
+            }
 
             // Execute using pre-prepared CStrings (no allocation)
             unsafe {
@@ -727,6 +846,29 @@ pub fn execute_supervised(
                 None
             };
 
+            // On Linux: if the parent determined seccomp proxy fallback is needed,
+            // receive the proxy notify fd from the child. Only attempt recv when
+            // we know the child will send it (both sides use the same flag).
+            #[cfg(target_os = "linux")]
+            let proxy_notify_fd: Option<OwnedFd> = if config.seccomp_proxy_fallback {
+                if let Some(ref sup_sock) = supervisor_sock {
+                    match sup_sock.recv_fd() {
+                        Ok(fd) => {
+                            debug!("Received proxy seccomp notify fd from child");
+                            Some(fd)
+                        }
+                        Err(e) => {
+                            warn!("Failed to receive proxy seccomp notify fd: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Set up signal forwarding.
             setup_signal_forwarding(child);
             let _signal_forwarding_guard = SignalForwardingGuard;
@@ -797,6 +939,7 @@ pub fn execute_supervised(
                             &mut sup_sock,
                             sup_cfg,
                             seccomp_notify_fd.as_ref(),
+                            proxy_notify_fd.as_ref(),
                             &initial_caps,
                             trust_interceptor,
                             relay.as_ref(),
@@ -1260,17 +1403,20 @@ fn run_supervisor_loop(
 ///
 /// Returns the child's wait status and any denial records collected.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn run_supervisor_loop(
     child: Pid,
     sock: &mut SupervisorSocket,
     config: &SupervisorConfig<'_>,
     seccomp_fd: Option<&OwnedFd>,
+    proxy_seccomp_fd: Option<&OwnedFd>,
     initial_caps: &[(std::path::PathBuf, bool)],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     relay: Option<&PtyRelay<'_>>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
     let sock_fd = sock.as_raw_fd();
     let notify_raw_fd = seccomp_fd.map(|fd| fd.as_raw_fd());
+    let proxy_notify_raw_fd = proxy_seccomp_fd.map(|fd| fd.as_raw_fd());
     let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
     let mut denials = Vec::new();
     let mut seen_request_ids = HashSet::new();
@@ -1286,6 +1432,7 @@ fn run_supervisor_loop(
         // [1] seccomp notify fd (or -1 if absent)
         // [2] real_tty (user input for relay, or -1 if no relay)
         // [3] pty_master (child output for relay, or -1 if no relay)
+        // [4] proxy seccomp notify fd (or -1 if absent)
         let mut pfds = [
             libc::pollfd {
                 fd: if sock_fd_active { sock_fd } else { -1 },
@@ -1307,16 +1454,21 @@ fn run_supervisor_loop(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: proxy_notify_raw_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
 
         // SAFETY: pfds is a valid array on the stack
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 4, 200) };
+        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 5, 200) };
 
         match ret.cmp(&0) {
             std::cmp::Ordering::Greater => {
                 // [0] Supervisor socket
                 if sock_fd_active && pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    if notify_raw_fd.is_some() {
+                    if notify_raw_fd.is_some() || proxy_notify_raw_fd.is_some() {
                         debug!("Supervisor socket closed, continuing for seccomp notifications");
                         sock_fd_active = false;
                     } else {
@@ -1393,6 +1545,19 @@ fn run_supervisor_loop(
                 if relay.is_some() && pfds[3].revents & libc::POLLIN != 0 {
                     pty_mux::relay_bytes(relay_master_fd, relay_tty_fd);
                 }
+
+                // [4] Proxy seccomp notify fd (connect/bind interception)
+                if pfds[4].revents & libc::POLLIN != 0 {
+                    if let Some(pfd) = proxy_notify_raw_fd {
+                        if let Err(e) = supervisor_linux::handle_network_notification(
+                            pfd,
+                            config,
+                            &mut rate_limiter,
+                        ) {
+                            debug!("Error handling proxy seccomp notification: {}", e);
+                        }
+                    }
+                }
             }
             std::cmp::Ordering::Less => {
                 let err = std::io::Error::last_os_error();
@@ -1438,7 +1603,7 @@ fn run_supervisor_loop(
 /// Handle a single supervisor IPC message.
 ///
 /// Flow:
-/// 1. Check `never_grant` - permanently blocked paths are rejected immediately
+/// 1. Check protected nono state roots - those paths are rejected immediately
 /// 2. Delegate to `ApprovalBackend` for the decision
 /// 3. If granted, open the path and send the fd via `SCM_RIGHTS`
 /// 4. Send the decision response
@@ -1482,17 +1647,20 @@ fn handle_supervisor_message(
             }
             seen_request_ids.insert(request.request_id.clone());
 
-            // 1. Check never_grant list first (before consulting the backend)
-            let never_grant_check = config.never_grant.check(&request.path);
-
             // Digest from trust verification, used for TOCTOU re-check at open time.
             // Set by the trust interceptor branch when an instruction file is verified.
             let mut verified_digest: Option<String> = None;
 
-            let decision = if never_grant_check.is_blocked() {
+            let decision = if let Some(protected_root) =
+                crate::protected_paths::overlapping_protected_root(
+                    &request.path,
+                    false,
+                    config.protected_roots,
+                ) {
                 debug!(
-                    "Supervisor: path {} blocked by never_grant",
-                    request.path.display()
+                    "Supervisor: path {} blocked by protected root {}",
+                    request.path.display(),
+                    protected_root.display()
                 );
                 record_denial(
                     denials,
@@ -1504,7 +1672,8 @@ fn handle_supervisor_message(
                 );
                 ApprovalDecision::Denied {
                     reason: format!(
-                        "Path is permanently blocked by never_grant policy: {}",
+                        "Path overlaps protected nono state root '{}': {}",
+                        protected_root.display(),
                         request.path.display()
                     ),
                 }
@@ -1611,7 +1780,7 @@ fn handle_supervisor_message(
                 match open_path_for_access(
                     &request.path,
                     &request.access,
-                    config.never_grant,
+                    config.protected_roots,
                     verified_digest.as_deref(),
                     Some(ProcfsAccessContext::new(child.as_raw() as u32, None)),
                 ) {
@@ -2092,10 +2261,10 @@ impl std::error::Error for OpenPathError {}
 ///
 /// # Security
 ///
-/// This function canonicalizes the path and re-checks it against the
-/// `never_grant` list AFTER resolution. This prevents symlink-based
-/// bypasses where a child creates `/tmp/innocent -> /etc/shadow` and
-/// requests access to `/tmp/innocent`.
+/// This function canonicalizes the path and re-checks it against protected
+/// nono state roots AFTER resolution. This prevents symlink-based bypasses
+/// where a child creates `/tmp/innocent -> ~/.nono` and requests access to the
+/// innocuous alias.
 ///
 /// File creation is intentionally disabled (`create(false)`) -- the
 /// supervisor only grants access to existing files. File creation should
@@ -2103,7 +2272,7 @@ impl std::error::Error for OpenPathError {}
 fn open_path_for_access(
     path: &Path,
     access: &nono::AccessMode,
-    never_grant: &NeverGrantChecker,
+    protected_roots: &[PathBuf],
     trust_digest: Option<&str>,
     procfs_context: Option<ProcfsAccessContext>,
 ) -> std::result::Result<std::fs::File, OpenPathError> {
@@ -2123,14 +2292,14 @@ fn open_path_for_access(
         )
     })?;
 
-    // Re-check never_grant on the resolved path. A symlink could point
-    // from an innocuous path to a never_grant target.
-    let check = never_grant.check(&canonical);
-    if check.is_blocked() {
+    if let Some(protected_root) =
+        crate::protected_paths::overlapping_protected_root(&canonical, false, protected_roots)
+    {
         return Err(OpenPathError::policy_blocked(format!(
-            "Path {} resolves to {} which is blocked by never_grant policy",
+            "Path {} resolves to {} which overlaps protected nono state root '{}'",
             path.display(),
             canonical.display(),
+            protected_root.display(),
         )));
     }
 
@@ -2451,7 +2620,6 @@ mod tests {
     /// causing the loop to see POLLHUP and return.
     #[test]
     fn test_supervisor_loop_runs_without_pty_relay() {
-        use nono::NeverGrantChecker;
         use std::os::unix::net::UnixStream;
 
         struct DenyAll;
@@ -2473,16 +2641,18 @@ mod tests {
             .map_err(|e| format!("socketpair: {e}"))
             .expect("socketpair failed in test");
 
-        let never_grant = NeverGrantChecker::new(&[])
-            .map_err(|e| format!("never_grant: {e}"))
-            .expect("NeverGrantChecker::new failed in test");
         let backend = DenyAll;
         let sup_cfg = SupervisorConfig {
-            never_grant: &never_grant,
+            protected_roots: &[],
             approval_backend: &backend,
             session_id: "test-session",
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            allow_launch_services_active: false,
+            #[cfg(target_os = "linux")]
+            proxy_port: 0,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -2505,6 +2675,7 @@ mod tests {
                     &mut sock,
                     &sup_cfg,
                     None, // no seccomp
+                    None, // no proxy seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay — this is what we're testing
@@ -2531,6 +2702,92 @@ mod tests {
         }
     }
 
+    /// Verify that ProxyOnly mode on V4+ kernels does NOT deadlock.
+    ///
+    /// On Landlock V4+ kernels, ProxyOnly is handled by Landlock natively.
+    /// The seccomp_proxy_fallback flag should be false, so the parent must
+    /// NOT attempt to recv a proxy notify fd. This test verifies the
+    /// supervisor loop starts and exits cleanly with ProxyOnly caps but
+    /// no proxy seccomp filter.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_supervisor_loop_proxy_only_v4_no_deadlock() {
+        use std::os::unix::net::UnixStream;
+
+        struct DenyAll;
+        impl ApprovalBackend for DenyAll {
+            fn request_capability(
+                &self,
+                _req: &nono::supervisor::CapabilityRequest,
+            ) -> nono::Result<ApprovalDecision> {
+                Ok(ApprovalDecision::Denied {
+                    reason: "test".to_string(),
+                })
+            }
+            fn backend_name(&self) -> &str {
+                "deny-all-test"
+            }
+        }
+
+        let (parent_stream, child_stream) = UnixStream::pair()
+            .map_err(|e| format!("socketpair: {e}"))
+            .expect("socketpair failed in test");
+
+        let backend = DenyAll;
+        // ProxyOnly mode with proxy_port set, but seccomp_proxy_fallback is false
+        // (simulating V4+ where Landlock handles networking).
+        let sup_cfg = SupervisorConfig {
+            protected_roots: &[],
+            approval_backend: &backend,
+            session_id: "test-proxy-v4",
+            open_url_origins: &[],
+            open_url_allow_localhost: false,
+            allow_launch_services_active: false,
+            #[cfg(target_os = "linux")]
+            proxy_port: 8080,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
+        };
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // Child: close socket and exit. Does NOT send a proxy notify fd.
+                drop(child_stream);
+                drop(parent_stream);
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Parent { child }) => {
+                drop(child_stream);
+                let mut sock = SupervisorSocket::from_stream(parent_stream);
+
+                // Run supervisor loop with NO proxy seccomp fd.
+                // If the bug from before were present (unconditional recv_fd),
+                // this would deadlock because the child never sends a second fd.
+                let result = run_supervisor_loop(
+                    child,
+                    &mut sock,
+                    &sup_cfg,
+                    None, // no openat seccomp
+                    None, // no proxy seccomp — V4+ Landlock handles it
+                    &[],  // no initial caps
+                    None, // no trust interceptor
+                    None, // no PTY relay
+                );
+
+                let (status, denials) = result
+                    .map_err(|e| format!("supervisor loop: {e}"))
+                    .expect("supervisor loop should not deadlock");
+                assert!(denials.is_empty());
+
+                match status {
+                    WaitStatus::Exited(_, code) => assert_eq!(code, 0),
+                    other => panic!("unexpected wait status: {other:?}"),
+                }
+            }
+            Err(e) => panic!("fork failed: {e}"),
+        }
+    }
+
     struct TestDenyBackend;
     impl ApprovalBackend for TestDenyBackend {
         fn request_capability(
@@ -2548,16 +2805,19 @@ mod tests {
 
     #[test]
     fn test_validate_url_allowed_origin() {
-        let never_grant =
-            NeverGrantChecker::new(&[]).expect("NeverGrantChecker::new failed in test");
         let backend = TestDenyBackend;
         let origins = vec!["https://claude.ai".to_string()];
         let config = SupervisorConfig {
-            never_grant: &never_grant,
+            protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
             open_url_origins: &origins,
             open_url_allow_localhost: false,
+            allow_launch_services_active: false,
+            #[cfg(target_os = "linux")]
+            proxy_port: 0,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
         };
 
         // Allowed origin: validation passes
@@ -2576,15 +2836,18 @@ mod tests {
 
     #[test]
     fn test_validate_url_blocks_non_https() {
-        let never_grant =
-            NeverGrantChecker::new(&[]).expect("NeverGrantChecker::new failed in test");
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
-            never_grant: &never_grant,
+            protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            allow_launch_services_active: false,
+            #[cfg(target_os = "linux")]
+            proxy_port: 0,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -2601,22 +2864,30 @@ mod tests {
 
     #[test]
     fn test_validate_url_localhost() {
-        let never_grant =
-            NeverGrantChecker::new(&[]).expect("NeverGrantChecker::new failed in test");
         let backend = TestDenyBackend;
         let config_allow = SupervisorConfig {
-            never_grant: &never_grant,
+            protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
             open_url_origins: &[],
             open_url_allow_localhost: true,
+            allow_launch_services_active: false,
+            #[cfg(target_os = "linux")]
+            proxy_port: 0,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
         };
         let config_deny = SupervisorConfig {
-            never_grant: &never_grant,
+            protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            allow_launch_services_active: false,
+            #[cfg(target_os = "linux")]
+            proxy_port: 0,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
         };
 
         // Localhost denied when not allowed
@@ -2638,15 +2909,18 @@ mod tests {
 
     #[test]
     fn test_validate_url_max_length() {
-        let never_grant =
-            NeverGrantChecker::new(&[]).expect("NeverGrantChecker::new failed in test");
         let backend = TestDenyBackend;
         let config = SupervisorConfig {
-            never_grant: &never_grant,
+            protected_roots: &[],
             approval_backend: &backend,
             session_id: "test",
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            allow_launch_services_active: false,
+            #[cfg(target_os = "linux")]
+            proxy_port: 0,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -2724,6 +2998,48 @@ mod tests {
         assert!(
             script.contains(&format!("exec {helper} open-url-helper \"$url_arg\"")),
             "shim should exec the copied helper"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_should_install_macos_open_shim_respects_launch_services_flag() {
+        struct TestBackend;
+        impl ApprovalBackend for TestBackend {
+            fn request_capability(
+                &self,
+                _req: &nono::supervisor::CapabilityRequest,
+            ) -> nono::Result<ApprovalDecision> {
+                Ok(ApprovalDecision::Denied {
+                    reason: "test".to_string(),
+                })
+            }
+            fn backend_name(&self) -> &str {
+                "test"
+            }
+        }
+
+        let backend = TestBackend;
+        let config = SupervisorConfig {
+            protected_roots: &[],
+            approval_backend: &backend,
+            session_id: "test",
+            open_url_origins: &[],
+            open_url_allow_localhost: false,
+            allow_launch_services_active: true,
+            #[cfg(target_os = "linux")]
+            proxy_port: 0,
+            #[cfg(target_os = "linux")]
+            proxy_bind_ports: Vec::new(),
+        };
+
+        assert!(
+            !should_install_macos_open_shim(Some(&config)),
+            "launch services sessions should skip the macOS open shim"
+        );
+        assert!(
+            !should_install_macos_open_shim(None),
+            "without supervisor config, the helper should not install the macOS open shim"
         );
     }
 

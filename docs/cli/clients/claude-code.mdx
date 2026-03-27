@@ -3,27 +3,31 @@ title: Claude Code
 description: Sandboxing Anthropic Claude Code with nono
 ---
 
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) is Anthropic's CLI coding agent. It reads and writes files, runs commands, and interacts with git on your behalf. Running it under nono ensures it can only access what you explicitly allow.
+<Note>
+When you run Claude Code under `nono`, prefer using `nono` as the only sandbox layer. Leave Claude Code's built-in sandbox disabled so all filesystem and network boundaries come from the kernel-enforced `nono` policy.
+
+If you keep Claude Code's sandbox enabled, Anthropic documents an intentional escape hatch: when a command fails because of sandbox restrictions, Claude may retry it with `dangerouslyDisableSandbox` after going through Claude Code's normal permissions flow. To disable that fallback, set `"allowUnsandboxedCommands": false` in Claude Code's sandbox settings. See Anthropic's [sandboxing docs](https://code.claude.com/docs/en/sandboxing).
+</Note>
 
 ## Why Sandbox Claude Code?
 
-Claude Code operates includes its own sandbox mechanism, but the Agent is able to override the sandbox by calling `dangerouslyOverrideSandbox: true` and access any file and perform any operation on the system.
-
-![Claude Code using dangerouslyOverrideSandbox](/assets/claude-code-overrides-the-sandbox-without-permission.webp)
-
-This creates several risks:
-
-- It could read sensitive files outside your project (SSH keys, cloud credentials)
-- A prompt injection in a dependency could trigger unintended file access
-- Mistakes in file operations could affect directories outside your workspace
-
-nono's kernel-enforced sandbox makes these scenarios structurally impossible.
+Claude Code includes its own sandboxing, but Anthropic documents an intentional escape hatch: when a command fails because of sandbox restrictions, Claude may retry it with `dangerouslyDisableSandbox` after approval. Running Claude inside `nono` gives you a single kernel-enforced boundary that is easier to reason about and audit.
 
 ## Quick Start
 
 ```bash
 nono run --profile claude-code -- claude
 ```
+
+<Warning>
+**macOS users:** Claude Code needs to open a browser on **first use** (e.g., for `claude /login`), you must add the `--allow-launch-services` flag:
+
+```bash
+nono run --profile claude-code --allow-launch-services -- claude
+```
+After this initial login, you can exit and rerun without `--allow-launch-services` for better security.
+See [OAuth2 Login](#oauth2-login) for details.
+</Warning>
 
 The built-in profile provides:
 - **Read+write access** to the current working directory
@@ -50,11 +54,13 @@ If you need different permissions, create a custom profile at `~/.config/nono/pr
     "version": "1.0.0",
     "description": "Claude Code with additional project access"
   },
+  "security": {
+    "groups": ["git_config"]
+  },
   "filesystem": {
     "allow": ["$WORKDIR", "$HOME/.claude"],
     "read": ["$HOME/shared-libs"],
-    "allow_file": ["$HOME/.claude.json"],
-    "read_file": ["$HOME/.gitconfig"]
+    "allow_file": ["$HOME/.claude.json"]
   },
   "network": {
     "block": false
@@ -137,15 +143,13 @@ If you want to prevent any outbound connections (e.g., for reviewing local code 
 nono run --profile claude-code --block-net -- claude
 ```
 
-### Temporarily Allow Unrestricted Network
+### Add Extra Domains
 
-If you want to keep the Claude Code profile's filesystem and command restrictions, but bypass its proxy filtering for a single session:
+If Claude Code needs to reach a domain not in the built-in network profile:
 
 ```bash
-nono run --profile claude-code --allow-net -- claude
+nono run --profile claude-code --allow-domain my-internal-api.example.com -- claude
 ```
-
-This also disables any proxy-based credential injection configured by the profile for that run.
 
 ## OAuth2 Login
 
@@ -243,16 +247,33 @@ Claude Code installs a VS Code extension on startup. The built-in profile alread
 
 ### Git Configuration
 
-Claude Code reads git configuration for repository operations. The built-in profile already grants read access to `~/.gitconfig`, `~/.gitignore_global`, and `~/.config/git/ignore`. No additional flags are needed for git operations.
+Claude Code reads git configuration for repository operations. The built-in profile includes the `git_config` group, which grants read access to `~/.gitconfig`, `~/.gitignore_global`, and `~/.config/git/ignore`. No additional flags are needed for git operations.
 
 ## Secretive (SSH Keys in Secure Enclave)
 
-If you use [Secretive](https://github.com/maxgoedjen/secretive) to store SSH keys in the macOS Secure Enclave, git commit signing (`git commit -S`) needs access to the Secretive agent socket. A community profile is provided at `data/profiles/claude-code-secretive.toml`.
+If you use [Secretive](https://github.com/maxgoedjen/secretive) to store SSH keys in the macOS Secure Enclave, git commit signing (`git commit -S`) needs access to the Secretive agent socket. Create a custom profile that extends the built-in Claude Code profile:
 
-**Install the profile:**
-```bash
-mkdir -p ~/.config/nono/profiles
-cp data/profiles/claude-code-secretive.toml ~/.config/nono/profiles/
+Save as `~/.config/nono/profiles/claude-code-secretive.json`:
+
+```json
+{
+  "meta": {
+    "name": "claude-code-secretive",
+    "version": "1.0.0",
+    "description": "Claude Code with Secretive SSH agent support"
+  },
+  "extends": "claude-code",
+  "filesystem": {
+    "read": [
+      "$HOME/.ssh/config",
+      "$HOME/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"
+    ],
+    "allow_file": ["$HOME/.ssh/known_hosts"]
+  },
+  "policy": {
+    "add_allow_readwrite": ["$HOME/.ssh/known_hosts"]
+  }
+}
 ```
 
 **Usage:**
@@ -261,12 +282,12 @@ nono run --profile claude-code-secretive --allow-cwd -- claude
 ```
 
 The profile extends the standard Claude Code profile with:
-- **Read access** to `~/.gitconfig` and `~/.ssh/config` (git signing configuration)
+- **Read access** to `~/.ssh/config` (git signing configuration)
 - **Read access** to the Secretive agent socket (`~/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh`)
 - **Read+write access** to `~/.ssh/known_hosts` (SSH may append new host keys)
 
 <Note>
-The Secretive socket is a Unix domain socket, not a regular file. nono v0.4+ supports granting capabilities on sockets directly, so only the socket itself is exposed — not the entire container directory.
+The Secretive socket is a Unix domain socket, not a regular file. nono supports granting capabilities on sockets directly, so only the socket itself is exposed — not the entire container directory.
 </Note>
 ## Overriding Profile Settings
 
@@ -279,8 +300,8 @@ nono run --profile claude-code --allow ~/other-project -- claude
 # Use profile but block network
 nono run --profile claude-code --block-net -- claude
 
-# Use profile but temporarily allow unrestricted network
-nono run --profile claude-code --allow-net -- claude
+# Use profile but add a custom domain
+nono run --profile claude-code --allow-domain custom-api.example.com -- claude
 ```
 
 See [Security Profiles](/cli/features/profiles-groups) for details on profile format and precedence rules.

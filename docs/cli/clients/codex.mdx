@@ -5,6 +5,18 @@ description: Sandboxing OpenAI Codex CLI with nono
 
 Codex is OpenAI's CLI coding agent. It reads repositories, writes files, runs commands, and stores local session state. Running it under nono keeps that access confined to the project and state paths you intentionally grant.
 
+<Note>
+When you run Codex under `nono`, prefer a single sandbox layer: let `nono` enforce filesystem and network boundaries, and start Codex with its own sandbox disabled.
+
+Recommended invocation:
+
+```bash
+nono run --profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
+```
+
+This keeps Codex's approval flow while avoiding nested sandboxes that can make denials harder to diagnose. See OpenAI's [agent approvals and security docs](https://developers.openai.com/codex/agent-approvals-security).
+</Note>
+
 ## Why Sandbox Codex?
 
 Codex is designed to inspect code, execute tools, and persist local state. Without isolation:
@@ -18,7 +30,7 @@ nono makes those boundaries kernel-enforced instead of advisory.
 ## Quick Start
 
 ```bash
-nono run --profile codex -- codex
+nono run --profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 The built-in profile provides:
@@ -69,13 +81,13 @@ The built-in profile includes the required browser-open allowlist:
 On Linux, no additional flags are needed:
 
 ```bash
-nono run --profile codex -- codex
+nono run --profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 On macOS, enable LaunchServices temporarily for the login session:
 
 ```bash
-nono run --profile codex --allow-launch-services -- codex
+nono run --profile codex --allow-launch-services -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 After login completes, exit and rerun without `--allow-launch-services`.
@@ -89,7 +101,7 @@ After login completes, exit and rerun without `--allow-launch-services`.
 The built-in profile grants access to the directory you run Codex from. To pin access to a specific repository:
 
 ```bash
-nono run --profile codex --workdir ~/projects/my-app -- codex
+nono run --profile codex --workdir ~/projects/my-app -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 ### Read-Only Workspace
@@ -97,7 +109,7 @@ nono run --profile codex --workdir ~/projects/my-app -- codex
 If you want Codex to keep its local state but not modify the repository:
 
 ```bash
-nono run --read . --allow ~/.codex -- codex review
+nono run --read . --allow ~/.codex -- codex --sandbox danger-full-access --ask-for-approval on-request review
 ```
 
 ### Block Network for Local-Only Work
@@ -105,7 +117,7 @@ nono run --read . --allow ~/.codex -- codex review
 If you want to inspect local code without allowing outbound access:
 
 ```bash
-nono run --profile codex --block-net -- codex
+nono run --profile codex --block-net -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 ### Use Network Filtering
@@ -113,7 +125,7 @@ nono run --profile codex --block-net -- codex
 If you want Codex limited to the built-in host allowlist for coding workflows:
 
 ```bash
-nono run --profile codex --network-profile codex -- codex
+nono run --profile codex --network-profile codex -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 ### Additional Home-Directory Tools
@@ -126,7 +138,7 @@ If a tool exists on your `PATH` but Codex cannot launch it inside the sandbox, g
 nono run --profile codex \
   --read ~/.bun/bin \
   --read ~/go/bin \
-  -- codex
+  -- codex --sandbox danger-full-access --ask-for-approval on-request
 ```
 
 See [Network Filtering](/cli/features/network-proxy) and [Security Profiles](/cli/features/profiles-groups) for details on host allowlists, profile format, and precedence rules.

@@ -96,17 +96,9 @@ pub fn check_blocked_command(
         return Ok(None);
     }
 
-    // Check extra blocked commands first
+    // Check blocked commands from the resolved capability set.
     if extra_blocked.iter().any(|b| OsStr::new(b) == binary_os) {
         return Ok(Some(binary_os.to_string_lossy().into_owned()));
-    }
-
-    // Check default dangerous commands list from policy.json
-    let loaded_policy = policy::load_embedded_policy()?;
-    let dangerous = policy::get_dangerous_commands(&loaded_policy);
-    let binary_str = binary_os.to_string_lossy();
-    if dangerous.contains(binary_str.as_ref()) {
-        return Ok(Some(binary_str.into_owned()));
     }
 
     Ok(None)
@@ -148,12 +140,6 @@ mod tests {
 
     #[test]
     fn test_check_blocked_command_basic() {
-        assert!(check_blocked_command("rm", &[], &[])
-            .expect("should not fail")
-            .is_some());
-        assert!(check_blocked_command("dd", &[], &[])
-            .expect("should not fail")
-            .is_some());
         assert!(check_blocked_command("echo", &[], &[])
             .expect("should not fail")
             .is_none());
@@ -164,10 +150,11 @@ mod tests {
 
     #[test]
     fn test_check_blocked_command_with_path() {
-        assert!(check_blocked_command("/bin/rm", &[], &[])
+        let blocked = vec!["rm".to_string(), "dd".to_string()];
+        assert!(check_blocked_command("/bin/rm", &[], &blocked)
             .expect("should not fail")
             .is_some());
-        assert!(check_blocked_command("/usr/bin/dd", &[], &[])
+        assert!(check_blocked_command("/usr/bin/dd", &[], &blocked)
             .expect("should not fail")
             .is_some());
     }
@@ -175,10 +162,11 @@ mod tests {
     #[test]
     fn test_check_blocked_command_with_override() {
         let allowed = vec!["rm".to_string()];
-        assert!(check_blocked_command("rm", &allowed, &[])
+        let blocked = vec!["rm".to_string(), "dd".to_string()];
+        assert!(check_blocked_command("rm", &allowed, &blocked)
             .expect("should not fail")
             .is_none());
-        assert!(check_blocked_command("dd", &allowed, &[])
+        assert!(check_blocked_command("dd", &allowed, &blocked)
             .expect("should not fail")
             .is_some());
     }
@@ -191,7 +179,14 @@ mod tests {
             .is_some());
         assert!(check_blocked_command("rm", &[], &extra)
             .expect("should not fail")
-            .is_some());
+            .is_none());
+    }
+
+    #[test]
+    fn test_check_blocked_command_only_uses_resolved_policy() {
+        assert!(check_blocked_command("rm", &[], &[])
+            .expect("should not fail")
+            .is_none());
     }
 
     #[test]

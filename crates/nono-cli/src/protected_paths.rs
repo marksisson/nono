@@ -26,22 +26,6 @@ impl ProtectedRoots {
         })
     }
 
-    /// Return protected roots as absolute/canonicalized path strings for
-    /// feeding into `NeverGrantChecker`.
-    pub fn as_strings(&self) -> Result<Vec<String>> {
-        self.roots
-            .iter()
-            .map(|p| {
-                p.to_str().map(|s| s.to_owned()).ok_or_else(|| {
-                    NonoError::SandboxInit(format!(
-                        "Protected root path is not valid UTF-8: {}",
-                        p.display()
-                    ))
-                })
-            })
-            .collect()
-    }
-
     /// Return a slice of protected root paths.
     pub fn as_paths(&self) -> &[PathBuf] {
         &self.roots
@@ -98,6 +82,27 @@ pub fn validate_requested_path_against_protected_roots(
     }
 
     Ok(())
+}
+
+/// Return the protected root overlapped by a requested path, if any.
+#[must_use]
+pub fn overlapping_protected_root(
+    path: &Path,
+    is_file: bool,
+    protected_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let requested_path = resolve_path(path);
+    let resolved_roots: Vec<PathBuf> = protected_roots.iter().map(|p| resolve_path(p)).collect();
+
+    for protected_root in &resolved_roots {
+        let inside_protected = requested_path.starts_with(protected_root);
+        let parent_of_protected = !is_file && protected_root.starts_with(&requested_path);
+        if inside_protected || parent_of_protected {
+            return Some(protected_root.clone());
+        }
+    }
+
+    None
 }
 
 /// Resolve path by canonicalizing the full path, or canonicalizing the longest
@@ -201,16 +206,16 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn as_strings_rejects_non_utf8_paths() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
+    fn overlapping_protected_root_reports_match() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let protected = tmp.path().join(".nono");
+        std::fs::create_dir_all(&protected).expect("mkdir");
+        let child = protected.join("rollbacks");
 
-        let non_utf8 = PathBuf::from(OsString::from_vec(vec![0x66, 0x80, 0x6f]));
-        let roots = ProtectedRoots {
-            roots: vec![non_utf8],
-        };
-        roots.as_strings().expect_err("non-utf8 path must error");
+        let overlap = overlapping_protected_root(&child, false, std::slice::from_ref(&protected));
+        let expected = std::fs::canonicalize(&protected).unwrap_or(protected);
+
+        assert_eq!(overlap, Some(expected));
     }
 }

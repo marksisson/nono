@@ -25,6 +25,24 @@ pub fn embedded_network_policy_json() -> &'static str {
     EMBEDDED_NETWORK_POLICY_JSON
 }
 
+/// Embedded profile JSON Schema (compiled into binary by build.rs)
+const EMBEDDED_PROFILE_SCHEMA: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/nono-profile.schema.json"));
+
+/// Get the embedded profile JSON Schema
+pub fn embedded_profile_schema() -> &'static str {
+    EMBEDDED_PROFILE_SCHEMA
+}
+
+/// Embedded profile authoring guide (compiled into binary by build.rs)
+const EMBEDDED_PROFILE_GUIDE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/profile-authoring-guide.md"));
+
+/// Get the embedded profile authoring guide
+pub fn embedded_profile_guide() -> &'static str {
+    EMBEDDED_PROFILE_GUIDE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

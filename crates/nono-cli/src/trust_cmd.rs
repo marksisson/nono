@@ -3,9 +3,10 @@
 //! Implements `nono trust sign|verify|list|keygen` subcommands.
 
 use crate::cli::{
-    TrustArgs, TrustCommands, TrustExportKeyArgs, TrustKeygenArgs, TrustListArgs, TrustSignArgs,
-    TrustSignPolicyArgs, TrustVerifyArgs,
+    TrustArgs, TrustCommands, TrustExportKeyArgs, TrustInitArgs, TrustKeygenArgs, TrustListArgs,
+    TrustSignArgs, TrustSignPolicyArgs, TrustVerifyArgs,
 };
+use crate::trust_keystore;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use colored::Colorize;
@@ -20,9 +21,14 @@ const TRUST_SERVICE: &str = "nono-trust";
 /// Keystore service name for public keys (verification-only, no private key material)
 const TRUST_PUB_SERVICE: &str = "nono-trust-pub";
 
+/// Test-only override for the user trust policy path.
+#[cfg(feature = "test-trust-overrides")]
+pub(crate) const TEST_USER_POLICY_PATH_ENV: &str = "NONO_TRUST_TEST_USER_POLICY_PATH";
+
 /// Run a trust subcommand.
 pub fn run_trust(args: TrustArgs) -> Result<()> {
     match args.command {
+        TrustCommands::Init(init_args) => run_init(init_args),
         TrustCommands::Sign(sign_args) => run_sign(sign_args),
         TrustCommands::SignPolicy(sign_policy_args) => run_sign_policy(sign_policy_args),
         TrustCommands::Verify(verify_args) => run_verify(verify_args),
@@ -33,6 +39,120 @@ pub fn run_trust(args: TrustArgs) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// init
+// ---------------------------------------------------------------------------
+
+fn run_init(args: TrustInitArgs) -> Result<()> {
+    let is_user = args.user;
+    let policy_path = if is_user {
+        let path = user_trust_policy_path().ok_or_else(|| {
+            nono::NonoError::TrustPolicy("could not determine user config directory".to_string())
+        })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(nono::NonoError::Io)?;
+        }
+        path
+    } else {
+        let cwd = std::env::current_dir().map_err(nono::NonoError::Io)?;
+        cwd.join("trust-policy.json")
+    };
+
+    if policy_path.exists() && !args.force {
+        return Err(nono::NonoError::TrustPolicy(format!(
+            "{} already exists (use --force to overwrite)",
+            policy_path.display()
+        )));
+    }
+
+    let patterns = if is_user && args.include.is_empty() {
+        // User-level policies focus on publishers and enforcement, not file patterns
+        Vec::new()
+    } else {
+        args.include
+    };
+
+    if !is_user && patterns.is_empty() {
+        eprintln!("  {} no --include patterns specified", "Warning:".yellow(),);
+        eprintln!(
+            "  {}",
+            "Add patterns manually to trust-policy.json or re-run with --include.".yellow()
+        );
+    }
+
+    // Try to include the public key if a signing key exists
+    let key_id = args.key.as_deref().unwrap_or("default");
+    let publisher = match load_public_key_bytes(key_id) {
+        Ok(pub_bytes) => {
+            let b64 = base64_encode(&pub_bytes);
+            Some(serde_json::json!({
+                "name": key_id,
+                "key_id": key_id,
+                "public_key": b64
+            }))
+        }
+        Err(_) => {
+            eprintln!(
+                "  {} signing key '{}' not found in keystore, skipping publisher entry.",
+                "Note:".cyan(),
+                key_id
+            );
+            eprintln!(
+                "  {}",
+                "Run 'nono trust keygen' to generate a key, then re-run 'nono trust init'.".cyan()
+            );
+            None
+        }
+    };
+
+    let publishers = match publisher {
+        Some(p) => vec![p],
+        None => Vec::new(),
+    };
+
+    let policy = serde_json::json!({
+        "version": 1,
+        "includes": patterns,
+        "publishers": publishers,
+        "blocklist": {
+            "digests": [],
+            "publishers": []
+        },
+        "enforcement": "deny"
+    });
+
+    let json = serde_json::to_string_pretty(&policy).map_err(|e| {
+        nono::NonoError::TrustPolicy(format!("failed to serialize trust policy: {e}"))
+    })?;
+
+    std::fs::write(&policy_path, format!("{json}\n")).map_err(nono::NonoError::Io)?;
+
+    eprintln!("  {} {}", "Created".green(), policy_path.display());
+
+    if !patterns.is_empty() {
+        eprintln!("  Includes ({}):", patterns.len());
+        for p in &patterns {
+            eprintln!("    {p}");
+        }
+    }
+
+    if publishers.is_empty() {
+        eprintln!("\n  {}", "Next steps:".bold());
+        eprintln!("  1. nono trust keygen");
+        eprintln!("  2. nono trust init --force");
+        eprintln!("  3. nono trust sign-policy {}", policy_path.display());
+        eprintln!("  4. nono trust sign --all");
+    } else {
+        eprintln!("\n  {}", "Next steps:".bold());
+        eprintln!("  1. nono trust sign-policy {}", policy_path.display());
+        if !is_user {
+            eprintln!("  2. nono trust sign --all");
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // keygen
 // ---------------------------------------------------------------------------
 
@@ -40,15 +160,10 @@ fn run_keygen(args: TrustKeygenArgs) -> Result<()> {
     let key_id = &args.id;
 
     // Check if key already exists
-    if !args.force {
-        let entry = keyring::Entry::new(TRUST_SERVICE, key_id).map_err(|e| {
-            nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}"))
-        })?;
-        if entry.get_password().is_ok() {
-            return Err(nono::NonoError::KeystoreAccess(format!(
-                "key '{key_id}' already exists in keystore (use --force to overwrite)"
-            )));
-        }
+    if !args.force && trust_keystore::contains_secret(TRUST_SERVICE, key_id)? {
+        return Err(nono::NonoError::KeystoreAccess(format!(
+            "key '{key_id}' already exists in keystore (use --force to overwrite)"
+        )));
     }
 
     // Generate ECDSA P-256 key pair and get PKCS#8 bytes
@@ -66,27 +181,22 @@ fn run_keygen(args: TrustKeygenArgs) -> Result<()> {
     let hex_id = trust::key_id_hex(&key_pair)?;
     let pub_key = trust::export_public_key(&key_pair)?;
 
-    // Store PKCS#8 as base64 in system keystore (zeroized after store)
+    // Store PKCS#8 as base64 in the configured trust keystore.
     let pkcs8_b64 = Zeroizing::new(base64_encode(pkcs8_doc.as_ref()));
-    let entry = keyring::Entry::new(TRUST_SERVICE, key_id)
-        .map_err(|e| nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}")))?;
-    entry
-        .set_password(pkcs8_b64.as_str())
-        .map_err(|e| nono::NonoError::KeystoreAccess(format!("failed to store key: {e}")))?;
+    trust_keystore::store_secret(TRUST_SERVICE, key_id, pkcs8_b64.as_str())?;
 
     // Store public key separately so verification never needs the private key
     let pub_key_b64 = base64_encode(pub_key.as_bytes());
-    let pub_entry = keyring::Entry::new(TRUST_PUB_SERVICE, key_id)
-        .map_err(|e| nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}")))?;
-    pub_entry
-        .set_password(&pub_key_b64)
-        .map_err(|e| nono::NonoError::KeystoreAccess(format!("failed to store public key: {e}")))?;
+    trust_keystore::store_secret(TRUST_PUB_SERVICE, key_id, &pub_key_b64)?;
 
     eprintln!("{}", "Signing key generated successfully.".green());
     eprintln!("  Key ID:      {key_id}");
     eprintln!("  Fingerprint: {hex_id}");
     eprintln!("  Algorithm:   ECDSA P-256 (SHA-256)");
-    eprintln!("  Stored in:   system keystore (service: {TRUST_SERVICE})");
+    eprintln!(
+        "  Stored in:   {}",
+        trust_keystore::backend_description(TRUST_SERVICE)
+    );
     eprintln!();
     eprintln!("Public key (base64 DER, for trust-policy.json):");
     eprintln!("  {pub_key_b64}");
@@ -133,12 +243,11 @@ fn run_sign(args: TrustSignArgs) -> Result<()> {
     let files = resolve_files(&args.files, args.all, args.policy.as_deref())?;
 
     if files.is_empty() {
-        eprintln!("No instruction files found to sign.");
+        eprintln!("No files found to sign.");
         return Ok(());
     }
 
-    // Multi-file: produce a single .nono-trust.bundle with all subjects
-    if files.len() > 1 {
+    if args.multi_subject {
         return run_sign_multi_keyed(&files, &key_pair, key_id);
     }
 
@@ -236,10 +345,11 @@ fn run_sign_multi_keyed(files: &[PathBuf], key_pair: &trust::KeyPair, key_id: &s
 // ---------------------------------------------------------------------------
 
 fn run_sign_keyless(args: TrustSignArgs) -> Result<()> {
+    let multi_subject = args.multi_subject;
     let files = resolve_files(&args.files, args.all, args.policy.as_deref())?;
 
     if files.is_empty() {
-        eprintln!("No instruction files found to sign.");
+        eprintln!("No files found to sign.");
         return Ok(());
     }
 
@@ -259,8 +369,7 @@ fn run_sign_keyless(args: TrustSignArgs) -> Result<()> {
     let context = sigstore_sign::SigningContext::production();
     let signer = context.signer(token);
 
-    // Multi-file: produce a single .nono-trust.bundle with all subjects
-    if files.len() > 1 {
+    if multi_subject {
         return rt.block_on(run_sign_multi_keyless(&files, &signer, &jwt));
     }
 
@@ -548,6 +657,20 @@ fn run_sign_policy(args: TrustSignPolicyArgs) -> Result<()> {
     // Resolve the policy file path
     let policy_path = match args.file {
         Some(path) => path,
+        None if args.user => {
+            let user_path =
+                user_trust_policy_path().ok_or_else(|| nono::NonoError::TrustSigning {
+                    path: "~/.config/nono/trust-policy.json".to_string(),
+                    reason: "could not resolve user config directory".to_string(),
+                })?;
+            if !user_path.exists() {
+                return Err(nono::NonoError::TrustSigning {
+                    path: user_path.display().to_string(),
+                    reason: "user-level trust-policy.json not found. Run 'nono trust init --user' to create one.".to_string(),
+                });
+            }
+            user_path
+        }
         None => {
             let cwd = std::env::current_dir().map_err(nono::NonoError::Io)?;
             let default_path = cwd.join("trust-policy.json");
@@ -560,6 +683,9 @@ fn run_sign_policy(args: TrustSignPolicyArgs) -> Result<()> {
             default_path
         }
     };
+
+    // Validate the policy file is well-formed before signing.
+    trust::load_policy_from_file(&policy_path)?;
 
     let bundle_json = trust::sign_policy_file(&policy_path, &key_pair, key_id)?;
     trust::write_bundle(&policy_path, &bundle_json)?;
@@ -608,8 +734,15 @@ fn run_verify(args: TrustVerifyArgs) -> Result<()> {
         }
     }
 
+    // Run the same missing-literal check that nono run uses, so
+    // `trust verify --all` surfaces the same errors as startup.
+    if args.all {
+        let cwd_for_check = std::env::current_dir().map_err(nono::NonoError::Io)?;
+        crate::trust_scan::check_missing_literals(&policy, &cwd_for_check, &files, false)?;
+    }
+
     if files.is_empty() && multi_bundles.is_empty() {
-        eprintln!("No instruction files or multi-subject bundles found to verify.");
+        eprintln!("No files or multi-subject bundles found to verify.");
         return Ok(());
     }
 
@@ -881,10 +1014,13 @@ fn run_list(args: TrustListArgs) -> Result<()> {
     let policy = load_trust_policy(args.policy.as_deref())?;
 
     let cwd = std::env::current_dir().map_err(nono::NonoError::Io)?;
-    let files = trust::find_instruction_files(&policy, &cwd)?;
+    let files = trust::find_included_files(&policy, &cwd)?;
+
+    // Surface missing-literal warnings so `trust list` matches `nono run`.
+    crate::trust_scan::check_missing_literals(&policy, &cwd, &files, false)?;
 
     if files.is_empty() {
-        eprintln!("No instruction files found in current directory.");
+        eprintln!("No files found matching policy includes in current directory.");
         return Ok(());
     }
 
@@ -961,16 +1097,11 @@ fn run_list(args: TrustListArgs) -> Result<()> {
 /// Uses the `nono-trust-pub` service to avoid loading private key material
 /// into memory for verification-only operations.
 pub(crate) fn load_public_key_bytes(key_id: &str) -> Result<Vec<u8>> {
-    let entry = keyring::Entry::new(TRUST_PUB_SERVICE, key_id)
-        .map_err(|e| nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}")))?;
-
-    let b64 = entry.get_password().map_err(|e| match e {
-        keyring::Error::NoEntry => nono::NonoError::SecretNotFound(format!(
+    let b64 = trust_keystore::load_secret(TRUST_PUB_SERVICE, key_id).map_err(|e| match e {
+        nono::NonoError::SecretNotFound(_) => nono::NonoError::SecretNotFound(format!(
             "public key '{key_id}' not found in keystore (run 'nono trust keygen' to regenerate)"
         )),
-        other => nono::NonoError::KeystoreAccess(format!(
-            "failed to load public key '{key_id}': {other}"
-        )),
+        other => other,
     })?;
 
     base64_decode(&b64)
@@ -978,15 +1109,14 @@ pub(crate) fn load_public_key_bytes(key_id: &str) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn load_signing_key(key_id: &str) -> Result<trust::KeyPair> {
-    let entry = keyring::Entry::new(TRUST_SERVICE, key_id)
-        .map_err(|e| nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}")))?;
-
-    let pkcs8_b64 = Zeroizing::new(entry.get_password().map_err(|e| match e {
-        keyring::Error::NoEntry => nono::NonoError::SecretNotFound(format!(
-            "signing key '{key_id}' not found in keystore (run 'nono trust keygen' first)"
-        )),
-        other => nono::NonoError::KeystoreAccess(format!("failed to load key '{key_id}': {other}")),
-    })?);
+    let pkcs8_b64 = Zeroizing::new(trust_keystore::load_secret(TRUST_SERVICE, key_id).map_err(
+        |e| match e {
+            nono::NonoError::SecretNotFound(_) => nono::NonoError::SecretNotFound(format!(
+                "signing key '{key_id}' not found in keystore (run 'nono trust keygen' first)"
+            )),
+            other => other,
+        },
+    )?);
 
     let pkcs8_bytes = Zeroizing::new(base64_decode(pkcs8_b64.as_str()).map_err(|e| {
         nono::NonoError::KeystoreAccess(format!("corrupt key data in keystore: {e}"))
@@ -1032,6 +1162,9 @@ fn load_trust_policy(explicit_path: Option<&Path>) -> Result<trust::TrustPolicy>
                 return trust::merge_policies(&[user_policy, project_policy]);
             }
         }
+        let user_path = user_trust_policy_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.config/nono/trust-policy.json".to_string());
         eprintln!(
             "  {}",
             "Warning: project-level trust-policy.json found but no user-level policy exists."
@@ -1039,15 +1172,15 @@ fn load_trust_policy(explicit_path: Option<&Path>) -> Result<trust::TrustPolicy>
         );
         eprintln!(
             "  {}",
-            "Project policies are not authoritative without a user-level policy to anchor trust."
+            "A user-level policy defines who you trust across all projects (publishers, enforcement, blocklist)."
                 .yellow()
         );
-        let policy_path = user_trust_policy_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "~/.config/nono/trust-policy.json".to_string());
         eprintln!(
             "  {}",
-            format!("Create a signed policy at {policy_path} to enforce verification.").yellow()
+            format!(
+                "Run 'nono trust init --user' to create one, then 'nono trust sign-policy {user_path}' to sign it."
+            )
+            .yellow()
         );
         return Ok(project_policy);
     }
@@ -1086,8 +1219,28 @@ fn verify_policy_if_exists(policy_path: &Path) -> Result<()> {
     crate::trust_scan::verify_policy_signature(policy_path)
 }
 
-fn user_trust_policy_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("nono").join("trust-policy.json"))
+pub(crate) fn user_trust_policy_path() -> Option<PathBuf> {
+    #[cfg(feature = "test-trust-overrides")]
+    {
+        if let Some(raw_path) = std::env::var_os(TEST_USER_POLICY_PATH_ENV) {
+            if !raw_path.is_empty() {
+                let path = PathBuf::from(&raw_path);
+                if path.is_absolute() {
+                    return Some(path);
+                }
+
+                tracing::warn!(
+                    "Ignoring invalid {}='{}' (must be absolute), falling back to user config dir",
+                    TEST_USER_POLICY_PATH_ENV,
+                    path.display()
+                );
+            }
+        }
+    }
+
+    crate::profile::resolve_user_config_dir()
+        .ok()
+        .map(|d| d.join("nono").join("trust-policy.json"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,8 +1254,15 @@ fn resolve_files(
 ) -> Result<Vec<PathBuf>> {
     if all {
         let policy = load_trust_policy(policy_path)?;
+        if policy.includes.is_empty() {
+            eprintln!(
+                "No files found to sign: trust policy has no 'includes' patterns.\n\
+                 Create a trust policy with: nono trust init --include \"<pattern>\""
+            );
+            return Ok(Vec::new());
+        }
         let cwd = std::env::current_dir().map_err(nono::NonoError::Io)?;
-        trust::find_instruction_files(&policy, &cwd)
+        trust::find_included_files(&policy, &cwd)
     } else {
         canonicalize_paths(explicit)
     }
@@ -1116,7 +1276,7 @@ fn resolve_files_with_policy(
 ) -> Result<Vec<PathBuf>> {
     if all {
         let cwd = std::env::current_dir().map_err(nono::NonoError::Io)?;
-        trust::find_instruction_files(policy, &cwd)
+        trust::find_included_files(policy, &cwd)
     } else {
         canonicalize_paths(explicit)
     }
@@ -1315,11 +1475,34 @@ mod tests {
         assert!(path.is_some());
     }
 
+    #[cfg(feature = "test-trust-overrides")]
+    #[test]
+    fn user_trust_policy_path_prefers_test_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let override_path = dir.path().join("trust-policy.json");
+        let original = std::env::var(TEST_USER_POLICY_PATH_ENV).ok();
+
+        std::env::set_var(TEST_USER_POLICY_PATH_ENV, &override_path);
+        let resolved = user_trust_policy_path();
+
+        match original {
+            Some(value) => std::env::set_var(TEST_USER_POLICY_PATH_ENV, value),
+            None => std::env::remove_var(TEST_USER_POLICY_PATH_ENV),
+        }
+
+        assert_eq!(resolved, Some(override_path));
+    }
+
     #[test]
     fn load_trust_policy_returns_default_when_no_file() {
         // CWD mutation with catch_unwind to guarantee cleanup even on panic.
+        // Isolate from real user config dir to avoid picking up invalid files.
         let dir = tempfile::tempdir().unwrap();
         let original = std::env::current_dir().unwrap();
+        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let xdg_dir = dir.path().join("xdg");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
 
         let result = std::panic::catch_unwind(|| {
             std::env::set_current_dir(dir.path()).unwrap();
@@ -1328,6 +1511,10 @@ mod tests {
         });
 
         std::env::set_current_dir(original).unwrap();
+        match orig_xdg {
+            Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
         result.unwrap();
     }
 }

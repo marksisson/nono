@@ -5,6 +5,10 @@ description: Pre-configured capability sets and composable security groups
 
 Profiles are pre-configured capability sets that define what a sandboxed process can access. Groups are the composable building blocks that profiles are made from. Together they codify security policy so you don't have to specify flags manually every time.
 
+<Tip>
+  Use `nono policy` to inspect, compare, and validate profiles and groups from the command line. See [Policy Introspection](/cli/features/policy-introspection) for details.
+</Tip>
+
 ## Profiles
 
 ### Why Profiles?
@@ -46,20 +50,28 @@ Profiles use JSON format:
     "version": "1.0.0",
     "description": "Profile for my custom agent"
   },
-  "interactive": false,
   "workdir": {
     "access": "readwrite"
   },
   "security": {
-    "groups": ["node_runtime", "python_runtime"]
+    "groups": ["node_runtime", "python_runtime", "git_config"]
   },
   "filesystem": {
     "allow": ["$HOME/.config/my-agent"],
     "read": [],
     "write": [],
     "allow_file": [],
-    "read_file": ["$HOME/.gitconfig"],
+    "read_file": [],
     "write_file": []
+  },
+  "policy": {
+    "exclude_groups": [],
+    "add_allow_read": [],
+    "add_allow_write": [],
+    "add_allow_readwrite": [],
+    "add_deny_access": [],
+    "add_deny_commands": [],
+    "override_deny": []
   },
   "network": {
     "block": false
@@ -80,45 +92,146 @@ The `workdir` section controls whether and how the current working directory is 
 
 When a profile specifies a workdir access level, nono will prompt the user to confirm CWD sharing (unless `--allow-cwd` is used to skip the prompt).
 
-### Secrets
+### Policy Overrides
 
-The `secrets` section maps keystore account names to environment variable names. Secrets are loaded from the system keystore (macOS Keychain / Linux Secret Service) before the sandbox is applied, then injected as environment variables.
+The `policy` section provides fine-grained, additive and subtractive composition on top of inherited groups and filesystem configuration. This is the primary mechanism for surgically customizing inherited profiles without redefining everything from scratch.
+
+| Field | Description |
+|-------|-------------|
+| `exclude_groups` | Remove groups from the resolved group set (exclusion wins over addition) |
+| `add_allow_read` | Additional read-only directories to allow |
+| `add_allow_write` | Additional write-only directories to allow |
+| `add_allow_readwrite` | Additional read+write directories to allow |
+| `add_deny_access` | Additional deny rules to apply (block read and write content). On macOS, Unix socket paths also emit a `network-outbound` deny so that `connect(2)` to the socket is blocked. |
+| `add_deny_commands` | Command names (basename only) to block execution of. Complements `add_deny_access` for defense-in-depth against tools like `docker`, `kubectl`, etc. |
+| `override_deny` | Paths to exempt from deny groups (must also have a matching grant) |
+
+#### Adding a Deny Rule to an Inherited Profile
+
+Block a specific path that a base profile would otherwise allow:
 
 ```json
 {
-  "secrets": {
-    "openai_api_key": "OPENAI_API_KEY",
-    "database_url": "DATABASE_URL"
+  "meta": {
+    "name": "claude-deny-git",
+    "version": "1.0.0"
+  },
+  "extends": "claude-code",
+  "policy": {
+    "add_deny_access": ["$HOME/.gitconfig"]
   }
 }
 ```
 
 ```bash
-nono run --profile my-agent -- my-command
+nono run --profile claude-deny-git -- claude
 ```
 
-See [Credential Injection](/cli/features/credential-injection) for details on storing secrets in the keystore.
+#### Blocking Container Access (Docker, Podman, kubectl)
+
+Use `add_deny_access` and `add_deny_commands` together for defense-in-depth:
+
+```json
+{
+  "extends": "claude-code",
+  "meta": { "name": "no-docker", "version": "1.0.0" },
+  "policy": {
+    "add_deny_access": ["/var/run/docker.sock"],
+    "add_deny_commands": ["docker", "docker-compose", "podman", "kubectl"]
+  }
+}
+```
+
+On macOS, `add_deny_access` on a socket path also emits a `network-outbound` deny — Seatbelt classifies `connect(2)` as a network operation, so a file deny alone won't block it. `add_deny_commands` blocks the CLI tools directly as defense-in-depth.
+
+#### Adding Write-Only Access
+
+Grant write-only access to a directory without granting read:
+
+```json
+{
+  "meta": {
+    "name": "write-only-cache",
+    "version": "1.0.0"
+  },
+  "extends": "default",
+  "policy": {
+    "add_allow_write": ["$HOME/.cache/my-agent-cache"]
+  },
+  "workdir": {
+    "access": "none"
+  }
+}
+```
+
+#### Removing Groups from an Inherited Profile
+
+Remove the dangerous command blocking group to allow `rm`, `chmod`, etc.:
+
+```json
+{
+  "meta": {
+    "name": "no-dangerous-commands",
+    "version": "1.0.0"
+  },
+  "extends": "default",
+  "policy": {
+    "exclude_groups": [
+      "dangerous_commands",
+      "dangerous_commands_linux",
+      "dangerous_commands_macos"
+    ]
+  }
+}
+```
+
+#### Overriding a Deny Rule for a Specific Path
+
+Some deny groups (like `deny_credentials`) are marked as required and cannot be excluded. Use `override_deny` to punch a targeted hole through a deny group for a specific path. The path must also be explicitly granted via `filesystem` or `policy.add_allow_*`.
+
+```json
+{
+  "meta": {
+    "name": "docker-agent",
+    "version": "1.0.0"
+  },
+  "extends": "opencode",
+  "filesystem": {
+    "allow": ["$HOME/.docker"]
+  },
+  "policy": {
+    "override_deny": ["$HOME/.docker"]
+  }
+}
+```
+
+This allows access to `~/.docker` even though `deny_credentials` blocks it by default. The deny override does not implicitly grant access -- the matching `filesystem.allow` entry is required.
+
+This is equivalent to the CLI flag `--override-deny`:
+
+```bash
+nono run --profile opencode --allow ~/.docker --override-deny ~/.docker -- opencode
+```
 
 <Note>
-  For API keys, prefer [Credential Injection](/cli/features/credential-injection) over environment variable injection. Credential injection routes API calls through a reverse proxy that injects credentials transparently - the API key never enters the sandbox, even as an environment variable.
+  `policy` fields are additive across inheritance. A child profile's `add_deny_access` is merged with the base profile's `add_deny_access`, and `exclude_groups` from both levels are combined. The `filesystem` section works the same way - use `policy` when you need deny rules or write-only access that `filesystem` cannot express.
 </Note>
 
 ### Network Configuration
 
 The `network` section controls network access and credential injection.
 
-Within profile JSON, use `block` for the network toggle. The parser also accepts `allow_proxy` and `allow_port` for compatibility with the CLI naming style, while legacy `proxy_allow` and `port_allow` remain supported.
-
 ```json
 {
   "network": {
     "block": false,
     "network_profile": "claude-code",
-    "allow_proxy": ["my-internal-api.example.com"],
-    "allow_port": [3000],
-    "proxy_credentials": ["openai", "anthropic"],
-    "external_proxy": "squid.corp:3128",
-    "external_proxy_bypass": ["git.internal.corp", "*.dev.local"],
+    "allow_domain": ["my-internal-api.example.com"],
+    "open_port": [3000],
+    "listen_port": [8080],
+    "credentials": ["openai", "anthropic"],
+    "upstream_proxy": "squid.corp:3128",
+    "upstream_bypass": ["git.internal.corp", "*.dev.local"],
     "custom_credentials": {
       "telegram": {
         "upstream": "https://api.telegram.org",
@@ -135,12 +248,13 @@ Within profile JSON, use `block` for the network toggle. The parser also accepts
 |-------|-------------|
 | `block` | Block all network access (default: `false`) |
 | `network_profile` | Network profile name for host filtering (e.g., `minimal`, `claude-code`, `enterprise`). Set to `null` in a child profile to clear an inherited value. |
-| `allow_proxy` | Additional hosts to allow through the proxy |
-| `allow_port` | Localhost TCP ports to allow bidirectional IPC (equivalent to `--allow-port`) |
-| `proxy_credentials` | Credential services to enable via reverse proxy (e.g., `openai`, `anthropic`) |
+| `allow_domain` | Additional domains to allow through the proxy |
+| `open_port` | Localhost TCP ports to allow bidirectional IPC (equivalent to `--open-port`) |
+| `listen_port` | TCP ports the sandboxed child may listen on (equivalent to `--listen-port`) |
+| `credentials` | Credential services to enable via reverse proxy (e.g., `openai`, `anthropic`) |
 | `custom_credentials` | Custom credential service definitions for APIs not in the built-in list |
-| `external_proxy` | External (enterprise) proxy address, e.g., `squid.corp:3128` |
-| `external_proxy_bypass` | Domains to bypass the external proxy (exact hostnames and `*.` wildcards) |
+| `upstream_proxy` | Upstream (enterprise) proxy address, e.g., `squid.corp:3128` |
+| `upstream_bypass` | Domains to bypass the upstream proxy (exact hostnames and `*.` wildcards) |
 
 #### Custom Credentials
 
@@ -199,6 +313,18 @@ The `rollback` section controls which files are excluded from [atomic rollback](
 
 These exclusions are combined with gitignore patterns from the working directory.
 
+### Skip Directories
+
+Use `skipdirs` to extend the built-in heavy-directory skip list for pre-exec trust scanning and rollback preflight:
+
+```json
+{
+  "skipdirs": ["generated", "vendor-cache"]
+}
+```
+
+Entries are matched as exact path component names. They do not grant or deny sandbox access; they only prune traversal during trust discovery and rollback heuristics.
+
 ### Environment Variables
 
 Profiles support these environment variables in path values:
@@ -214,35 +340,20 @@ Profiles support these environment variables in path values:
 
 ### Creating User Profiles
 
-1. Create the profiles directory:
-   ```bash
-   mkdir -p ~/.config/nono/profiles
-   ```
+Use `nono profile init` to scaffold a new profile:
 
-2. Create a JSON file:
-   ```json
-   // ~/.config/nono/profiles/my-agent.json
-   {
-     "meta": {
-       "name": "my-agent",
-       "version": "1.0.0"
-     },
-     "security": {
-       "groups": ["node_runtime"]
-     },
-     "filesystem": {
-       "allow": ["$WORKDIR"]
-     },
-     "network": {
-       "block": true
-     }
-   }
-   ```
+```bash
+# Scaffold a profile that inherits from default with the node_runtime group
+nono profile init my-agent --extends default --groups node_runtime
 
-3. Use the profile:
-   ```bash
-   nono run --profile my-agent -- my-agent-command
-   ```
+# Validate the generated profile
+nono policy validate ~/.config/nono/profiles/my-agent.json
+
+# Use the profile
+nono run --profile my-agent -- my-agent-command
+```
+
+See [Profile Authoring](/cli/features/profile-authoring) for the full workflow, including JSON Schema integration, editor autocomplete, and the LLM authoring guide.
 
 You can also load a profile by file path:
 
@@ -258,8 +369,8 @@ CLI flags always take precedence over profile settings:
 # Use claude-code profile but block network
 nono run --profile claude-code --block-net -- claude
 
-# Use claude-code profile but temporarily allow unrestricted network
-nono run --profile claude-code --allow-net -- claude
+# Use claude-code profile but add a custom domain
+nono run --profile claude-code --allow-domain custom-api.example.com -- claude
 
 # Add extra directory access
 nono run --profile claude-code --allow ~/other-project -- claude
@@ -288,14 +399,19 @@ Groups are named, composable collections of security rules. Profiles reference g
 Every profile's effective capability set is built through composition:
 
 ```
-(base_groups - trust_groups) + profile.security.groups + profile.filesystem + CLI flags
+((default_profile_groups + profile.security.groups) - profile.policy.exclude_groups) + profile.policy.add_* + profile.filesystem - deny_groups + profile.policy.override_deny + CLI flags
 ```
 
-1. **base_groups** are always applied (deny rules, system paths, dangerous commands)
-2. **trust_groups** are per-profile exclusions from base (e.g., removing `deny_credentials` for an infrastructure agent that legitimately needs credential access)
-3. **profile.security.groups** add additional groups on top
-4. **profile.filesystem** entries are additive
-5. **CLI overrides** (`--allow`, `--read`, etc.) are applied last
+1. **default_profile_groups** come from the built-in `default` profile
+2. **profile.security.groups** add additional groups on top
+3. **profile.policy.exclude_groups** removes groups from the composed set (exclusion wins)
+4. **profile.policy.add_allow_***, **profile.policy.add_deny_access**, and **profile.policy.add_deny_commands** apply additive overrides
+5. **profile.filesystem** entries are additive
+6. **profile.policy.override_deny** punches targeted holes through deny groups (requires matching grant)
+7. **CLI overrides** (`--allow`, `--read`, `--override-deny`, etc.) are applied last
+
+Exclusions are applied after group addition. If the same group appears in both
+`security.groups` and `policy.exclude_groups`, the exclusion wins.
 
 ### Group Taxonomy
 
@@ -326,14 +442,23 @@ Groups use a structured allow/deny taxonomy:
 
 ### Built-in Groups
 
-nono ships with 22 built-in groups:
+nono ships with 32 built-in groups:
 
 **Deny groups** (block sensitive content):
-- `deny_credentials` - SSH keys, cloud credentials, GPG keys
-- `deny_keychains_macos` - macOS Keychain databases
-- `deny_browser_data_macos` - Browser data (Chrome, Firefox, Safari, etc.)
-- `deny_shell_history` - Shell history files
-- `deny_shell_configs` - Shell config files (may contain API keys)
+- `deny_credentials` - SSH keys, cloud credentials, GPG keys, container and package manager tokens
+- `deny_keychains_macos` - macOS Keychain databases, 1Password, password-store
+- `deny_keychains_linux` - Linux keyring, 1Password, password-store
+- `deny_browser_data_macos` - Browser data on macOS (Chrome, Firefox, Safari, Edge, Arc, Brave)
+- `deny_browser_data_linux` - Browser data on Linux (Chrome, Firefox, Edge, Brave)
+- `deny_macos_private` - macOS Messages, Mail, Cookies, MobileSync
+- `deny_shell_history` - Shell history files (.bash_history, .zsh_history, .python_history)
+- `deny_shell_configs` - Shell config files that may contain API keys (.bashrc, .zshrc, .profile, .env)
+
+**Protection groups**:
+- `unlink_protection` - Prevents file deletion, with override for user-writable paths
+- `dangerous_commands` - Blocks `rm`, `dd`, `chmod`, `sudo`, `mkfs`, `pip`, `npm`, `kill`, etc.
+- `dangerous_commands_macos` - macOS-specific: `srm`, `brew`, `launchctl`
+- `dangerous_commands_linux` - Linux-specific: `shred`, `mkfs.*`, `fdisk`, `systemctl`, `apt`, `yum`, `dnf`, `pacman`
 
 **System path groups** (grant necessary system access):
 - `system_read_macos` - macOS system libraries, frameworks, dyld cache
@@ -341,15 +466,27 @@ nono ships with 22 built-in groups:
 - `system_write_macos` - macOS temp directories, cache paths
 - `system_write_linux` - Linux temp directories
 
+**Cache groups** (user-level caches and state):
+- `user_caches_macos` - ~/Library/Caches, ~/Library/Logs, ~/Library/Preferences
+- `user_caches_linux` - ~/.cache, ~/.local/state
+
 **Runtime groups** (language toolchain paths):
 - `node_runtime` - nvm, fnm, npm, pnpm, volta
 - `rust_runtime` - rustup, cargo
 - `python_runtime` - pyenv, conda, pip, uv
+- `go_runtime` - ~/go, /usr/local/go
+- `nix_runtime` - Nix profile paths, /nix/var (Linux only)
 - `user_tools` - Local bins, .desktop files, man pages, shell completions
+- `homebrew` - /opt/homebrew, /usr/local/Cellar, /usr/local/opt (macOS only)
 
-**Protection groups**:
-- `unlink_protection` - Prevents file deletion, with override for user-writable paths
-- `dangerous_commands` - Blocks `rm`, `dd`, `chmod`, `sudo`, `mkfs`, etc.
+**Tool-specific groups** (paths for specific applications):
+- `claude_code_macos` - macOS Keychain for Claude Code credential storage
+- `claude_code_linux` - ~/.local/share/claude
+- `claude_cache_linux` - ~/.cache/claude-cli-nodejs
+- `codex_macos` - macOS Keychain for Codex credential storage
+- `opencode_linux` - ~/.opencode/bin (Linux only, needed for Landlock exec)
+- `vscode_macos` - ~/.vscode, ~/Library/Application Support/Code
+- `vscode_linux` - ~/.vscode, ~/.config/Code
 
 <Note>
   Command blocking is a best-effort surface-level control. It matches against the executable name being invoked directly. A process can bypass this by calling the equivalent syscall from within an allowed interpreter (e.g., `os.remove()` in Python, `fs.unlinkSync()` in Node.js) or by invoking a renamed copy of the binary. For hard filesystem protection, rely on the kernel-enforced deny groups and `unlink_protection`, which cannot be bypassed from userspace regardless of how the operation is invoked.
@@ -374,16 +511,6 @@ Groups without a `platform` field (like `deny_credentials`) apply on all platfor
 
 Platform-specific groups use `_macos` or `_linux` suffixes by convention.
 
-### never_grant
-
-The `never_grant` list in policy.json defines paths that can never be granted access through the supervisor, even with explicit user approval:
-
-- `/etc/shadow`, `/etc/sudoers`, `/etc/passwd`
-- `/boot`, `/boot/grub`
-- macOS launch daemons
-- `~/.ssh/authorized_keys`, SSH private keys, `~/.gnupg`
-
-These are a hard safety net below all other policy.
 
 ### Platform Differences
 
@@ -395,19 +522,31 @@ These are a hard safety net below all other policy.
 
 ## Built-in Profiles
 
+### default
+
+The base profile that all other profiles extend. Provides system path access, deny groups for sensitive content, and dangerous command blocking. Does not grant working directory access or any user-specific paths.
+
+**Groups:** `deny_credentials`, `deny_keychains_macos`, `deny_keychains_linux`, `deny_browser_data_macos`, `deny_browser_data_linux`, `deny_macos_private`, `deny_shell_history`, `deny_shell_configs`, `system_read_macos`, `system_read_linux`, `system_write_macos`, `system_write_linux`, `user_tools`, `homebrew`, `dangerous_commands`, `dangerous_commands_macos`, `dangerous_commands_linux`
+
+**Network:** Allowed
+
+**CWD:** None
+
 ### claude-code
 
 ```bash
 nono run --profile claude-code -- claude
 ```
 
-**Groups:** `claude_code_macos`, `claude_code_linux`, `user_caches_macos`, `node_runtime`, `rust_runtime`, `python_runtime`, `vscode_macos`, `vscode_linux`, `unlink_protection` (plus all base_groups)
+**Groups:** `claude_code_macos`, `claude_code_linux`, `user_caches_macos`, `claude_cache_linux`, `node_runtime`, `rust_runtime`, `python_runtime`, `vscode_macos`, `vscode_linux`, `nix_runtime`, `git_config`, `unlink_protection` (plus `default` groups)
 
-**Filesystem:** `~/.claude` (read+write), `~/.claude.json` (read+write), plus platform-specific Claude Code and VS Code paths from the matching `_macos` or `_linux` groups
+**Filesystem:** `~/.claude` (read+write), `~/.claude.json` and `~/.claude.json.lock` (read+write), plus platform-specific Claude Code and VS Code paths from the matching `_macos` or `_linux` groups, and git config files from `git_config` group
 
 **Network:** Allowed
 
-**Special:** Auto-installs Claude Code hooks
+**CWD:** Read+write
+
+**Special:** Auto-installs Claude Code hooks. OAuth2 login support via `open_urls` (allows `https://claude.ai` and localhost). Profile opts into `allow_launch_services` for macOS browser opening.
 
 ### codex
 
@@ -415,13 +554,15 @@ nono run --profile claude-code -- claude
 nono run --profile codex -- codex
 ```
 
-**Filesystem:** `~/.codex` (read+write)
+**Groups:** `codex_macos`, `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `git_config`, `unlink_protection` (plus `default` groups)
 
-**Groups:** `node_runtime`, `rust_runtime`, `python_runtime`, `nix_runtime`, `unlink_protection` (plus all `base_groups`)
+**Filesystem:** `~/.codex` (read+write), plus git config files from `git_config` group
 
 **Network:** Allowed
 
-**Interactive:** Enabled
+**CWD:** Read+write
+
+**Special:** OAuth2 login support via `open_urls` (allows `https://auth.openai.com` and localhost). Profile opts into `allow_launch_services`.
 
 ### opencode
 
@@ -429,11 +570,13 @@ nono run --profile codex -- codex
 nono run --profile opencode -- opencode
 ```
 
-**Groups:** Base groups only
+**Groups:** `user_caches_macos`, `user_caches_linux`, `node_runtime`, `opencode_linux`, `git_config`, `unlink_protection` (plus `default` groups)
 
-**Filesystem:** `~/.config/opencode`, `~/.cache/opencode`, `~/.local/share/opencode` (all read+write)
+**Filesystem:** `~/.config/opencode`, `~/.cache/opencode`, `~/.local/share/opencode`, `~/.local/share/opentui` (all read+write), plus git config files from `git_config` group
 
 **Network:** Allowed
+
+**CWD:** Read+write
 
 ### openclaw
 
@@ -441,13 +584,75 @@ nono run --profile opencode -- opencode
 nono run --profile openclaw -- openclaw
 ```
 
-**Groups:** Base groups only
+**Groups:** `node_runtime` (plus `default` groups)
 
 **Filesystem:** `~/.openclaw`, `~/.config/openclaw`, `~/.local`, `$TMPDIR/openclaw-$UID` (all read+write)
 
+**Network:** Allowed
+
 **CWD:** Read-only
 
+### swival
+
+```bash
+nono run --profile swival -- swival
+```
+
+**Groups:** `python_runtime`, `node_runtime`, `user_caches_macos`, `user_caches_linux`, `git_config`, `unlink_protection` (plus `default` groups)
+
+**Filesystem:** `~/.config/swival`, `~/.local/share/swival` (read+write), plus git config files from `git_config` group
+
 **Network:** Allowed
+
+**CWD:** Read+write
+
+### python-dev
+
+```bash
+nono run --profile python-dev -- my-python-app
+```
+
+**Groups:** `python_runtime` (plus `default` groups)
+
+**Network:** Allowed, with `developer` network profile for host filtering
+
+**CWD:** Read+write
+
+### node-dev
+
+```bash
+nono run --profile node-dev -- npm start
+```
+
+**Groups:** `node_runtime` (plus `default` groups)
+
+**Network:** Allowed, with `developer` network profile for host filtering
+
+**CWD:** Read+write
+
+### go-dev
+
+```bash
+nono run --profile go-dev -- go run .
+```
+
+**Groups:** `go_runtime` (plus `default` groups)
+
+**Network:** Allowed, with `developer` network profile for host filtering
+
+**CWD:** Read+write
+
+### rust-dev
+
+```bash
+nono run --profile rust-dev -- cargo run
+```
+
+**Groups:** `rust_runtime` (plus `default` groups)
+
+**Network:** Allowed, with `developer` network profile for host filtering
+
+**CWD:** Read+write
 
 ---
 

@@ -1,5 +1,248 @@
 # Changelog
 
+## [0.25.0] - 2026-03-26
+
+### Features
+
+- *(undo)* Support per-root exclusion filters in snapshot manager (#506) ([#506](https://github.com/always-further/nono/pull/506))
+
+- *(sandbox/linux)* Add seccomp proxy-only network fallback (#503) ([#503](https://github.com/always-further/nono/pull/503))
+
+- *(trust)* Add skip_dirs support to trust scanning and rollback preflight (#498) ([#498](https://github.com/always-further/nono/pull/498))
+
+## [0.24.0] - 2026-03-25
+
+### Documentation
+
+- Add documentation for add_deny_commands (#495) ([#495](https://github.com/always-further/nono/pull/495))
+
+- Update GitHub Action badge to agent-sign (#494) ([#494](https://github.com/always-further/nono/pull/494))
+
+
+### Features
+
+- *(sandbox/linux)* Add seccomp fallback for network  (#496) ([#496](https://github.com/always-further/nono/pull/496))
+
+## [0.23.1] - 2026-03-25
+
+### Bug Fixes
+
+- Block Unix socket connections via add_deny_access; add add_deny_commands (#488) ([#488](https://github.com/always-further/nono/pull/488))
+
+- Handle relative paths in --rollback-dest pre-check (#486) ([#486](https://github.com/always-further/nono/pull/486))
+
+## [0.23.0] - 2026-03-24
+
+### Dependencies
+
+- *(deps)* Bump toml from 1.0.3+spec-1.1.0 to 1.0.6+spec-1.1.0 (#479) ([#479](https://github.com/always-further/nono/pull/479))
+
+- *(deps)* Bump which from 8.0.0 to 8.0.2 (#478) ([#478](https://github.com/always-further/nono/pull/478))
+
+- *(deps)* Bump aws-lc-rs from 1.16.1 to 1.16.2 (#477) ([#477](https://github.com/always-further/nono/pull/477))
+
+- *(deps)* Bump mislav/bump-homebrew-formula-action from 3.6 to 4.1 (#476) ([#476](https://github.com/always-further/nono/pull/476))
+
+- *(deps)* Bump actions/cache from 5.0.3 to 5.0.4 (#474) ([#474](https://github.com/always-further/nono/pull/474))
+
+- *(deps)* Bump always-further/agent-sign from 0.0.4 to 0.0.8 (#475) ([#475](https://github.com/always-further/nono/pull/475))
+
+
+### Documentation
+
+- Remove compiled PDF, keep Typst source
+
+
+### Features
+
+- *(query)* Add diagnostic details to path query results (#472) ([#472](https://github.com/always-further/nono/pull/472))
+
+- *(cli)* Add --rollback-dest flag to override snapshot storage path
+
+## [0.22.1] - 2026-03-23
+
+### Build
+
+- *(audit)* Add cargo-audit ignores for AWS-LC X.509 advisories (#449) ([#449](https://github.com/always-further/nono/pull/449))
+
+
+### CI/CD
+
+- Add change classification to skip unnecessary jobs (#456) ([#456](https://github.com/always-further/nono/pull/456))
+
+
+### Documentation
+
+- Detect system architecture in deb installation command (#455) ([#455](https://github.com/always-further/nono/pull/455))
+
+- Fix arrow direction in OS-level enforcement diagram (#453) ([#453](https://github.com/always-further/nono/pull/453))
+
+- *(clients)* Recommend disabling agent sandboxes when running under nono (#451) ([#451](https://github.com/always-further/nono/pull/451))
+
+## [0.22.0] - 2026-03-21
+
+### Dependencies
+
+- *(deps)* Bump rustls-webpki from 0.103.9 to 0.103.10 (#443) ([#443](https://github.com/always-further/nono/pull/443))
+
+
+### Features
+
+- *(trust)* Lazy verification of scan policies (#448) ([#448](https://github.com/always-further/nono/pull/448))
+
+## [0.21.0] - 2026-03-21
+
+### Bug Fixes
+
+- *(setup)* Detect Landlock via syscall probe instead of LSM file (#417) ([#417](https://github.com/always-further/nono/pull/417))
+
+- *(cli)* Add ~/.opencode to opencode profile paths (#421) ([#421](https://github.com/always-further/nono/pull/421))
+
+
+### Features
+
+- *(policy)* Add standard I/O and fd paths to base_posix group (#441) ([#441](https://github.com/always-further/nono/pull/441))
+
+- *(trust)* Add --user flag to sign-policy for user-level trust policy (#440) ([#440](https://github.com/always-further/nono/pull/440))
+
+- *(trust)* Scaffold policies, enforce missing includes at startup, and simplify write protection (#435) ([#435](https://github.com/always-further/nono/pull/435))
+
+
+### Doc
+
+- Fix installation command for nono-cli package (#426) ([#426](https://github.com/always-further/nono/pull/426))
+
+## [0.20.0] - 2026-03-18
+
+### Features
+
+- Support multiple base profiles in extends field (#399) ([#399](https://github.com/always-further/nono/pull/399))
+
+- *(cli)* Standardize network flag naming and add listen_port support (#415) ([#415](https://github.com/always-further/nono/pull/415))
+
+## [0.19.0] - 2026-03-18
+
+### Bug Fixes
+
+- *(deny)* Canonicalize parent directories in deny access rules (#393) ([#393](https://github.com/always-further/nono/pull/393))
+
+
+### Dependencies
+
+- *(deps)* Bump tempfile from 3.26.0 to 3.27.0 (#398) ([#398](https://github.com/always-further/nono/pull/398))
+
+- *(deps)* Bump sigstore-sign from 0.6.3 to 0.6.4 (#397) ([#397](https://github.com/always-further/nono/pull/397))
+
+- *(deps)* Bump clap from 4.5.60 to 4.6.0 (#396) ([#396](https://github.com/always-further/nono/pull/396))
+
+- *(deps)* Bump actions/download-artifact from 8.0.0 to 8.0.1 (#395) ([#395](https://github.com/always-further/nono/pull/395))
+
+- *(deps)* Bump softprops/action-gh-release from 2.5.0 to 2.6.1 (#394) ([#394](https://github.com/always-further/nono/pull/394))
+
+
+### Features
+
+- *(sandbox)* Add IpcMode capability for POSIX semaphores (macOS Seatbelt) (#412) ([#412](https://github.com/always-further/nono/pull/412))
+
+- *(learn)* Add macOS network tracing via nettop (#403) ([#403](https://github.com/always-further/nono/pull/403))
+
+- Add linux-arm64 (#402) ([#402](https://github.com/always-further/nono/pull/402))
+
+## [0.18.0] - 2026-03-16
+
+### Bug Fixes
+
+- *(hooks)* Use resolved path in capability display (#387) ([#387](https://github.com/always-further/nono/pull/387))
+
+- *(main)* Move cwd resolution before pre-fork sandbox setup (#370) ([#370](https://github.com/always-further/nono/pull/370))
+
+- *(policy)* Honor excluded dangerous command groups for direct exec (#368) ([#368](https://github.com/always-further/nono/pull/368))
+
+- *(config)* Remove hardcoded dangerous commands list (#366) ([#366](https://github.com/always-further/nono/pull/366))
+
+- *(exec)* Prevent implicit cwd access under restrictive profiles (#363) ([#363](https://github.com/always-further/nono/pull/363))
+
+
+### Documentation
+
+- *(profiles)* Simplify group-based profile creation guide (#390) ([#390](https://github.com/always-further/nono/pull/390))
+
+- *(profiles-groups)* Expand built-in profiles and add policy override examples (#376) ([#376](https://github.com/always-further/nono/pull/376))
+
+
+### Features
+
+- Restyle --help output with grouped sections and bold headings (#345) ([#345](https://github.com/always-further/nono/pull/345))
+
+- *(trust)* Skip well-known heavy directories in instruction file walk (#388) ([#388](https://github.com/always-further/nono/pull/388))
+
+- *(cli)* Add `nono profile` scaffolding and authoring tooling (#385) ([#385](https://github.com/always-further/nono/pull/385))
+
+- *(policy)* Extract git config paths into reusable group (#383) ([#383](https://github.com/always-further/nono/pull/383))
+
+- *(cli)* Add `nono policy` introspection subcommand (#382) ([#382](https://github.com/always-further/nono/pull/382))
+
+- *(profile)* Add profile-level override_deny for deny group exceptions (#380) ([#380](https://github.com/always-further/nono/pull/380))
+
+- *(macos)* Gate open shim installation behind launch services flag (#374) ([#374](https://github.com/always-further/nono/pull/374))
+
+- *(capability)* Remove exact file caps when deny patch overrides grant (#367) ([#367](https://github.com/always-further/nono/pull/367))
+
+- *(policy)* Deprecate security.trust_groups in favor of policy.exclude_groups (#357) ([#357](https://github.com/always-further/nono/pull/357))
+
+- *(policy)* Use default profile groups for runtime policy resolution (#356) ([#356](https://github.com/always-further/nono/pull/356))
+
+- *(policy)* Add extends field to embedded profiles (#355) ([#355](https://github.com/always-further/nono/pull/355))
+
+- Add default profile with base group configuration (#352) ([#352](https://github.com/always-further/nono/pull/352))
+
+- *(profile)* Add composable policy patch configuration (#351) ([#351](https://github.com/always-further/nono/pull/351))
+
+
+### Refactoring
+
+- *(setup)* Move banner printing to main.rs (#386) ([#386](https://github.com/always-further/nono/pull/386))
+
+- *(supervisor)* Remove never_grant in favor of protected roots (#360) ([#360](https://github.com/always-further/nono/pull/360))
+
+- *(policy)* Remove deprecated base_groups and trust_groups fields (#359) ([#359](https://github.com/always-further/nono/pull/359))
+
+- *(policy)* Deprecate base_groups in favor of default profile (#358) ([#358](https://github.com/always-further/nono/pull/358))
+
+## [0.17.1] - 2026-03-13
+
+### Bug Fixes
+
+- Narrow broad linux /etc and /proc reads in system_read policy (#350) ([#350](https://github.com/always-further/nono/pull/350))
+
+
+### Features
+
+- *(sandbox/linux)* Add Landlock V6 signal scoping support (#344) ([#344](https://github.com/always-further/nono/pull/344))
+
+
+### Miscellaneous
+
+- Release v0.17.0
+
+- Release v0.17.0
+
+## [0.17.0] - 2026-03-13
+
+### Bug Fixes
+
+- Narrow broad linux /etc and /proc reads in system_read policy (#350) ([#350](https://github.com/always-further/nono/pull/350))
+
+
+### Features
+
+- *(sandbox/linux)* Add Landlock V6 signal scoping support (#344) ([#344](https://github.com/always-further/nono/pull/344))
+
+
+### Miscellaneous
+
+- Release v0.17.0
+
 ## [0.17.0] - 2026-03-12
 
 ### Bug Fixes

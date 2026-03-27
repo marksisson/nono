@@ -14,9 +14,82 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  changes:
+    name: Classify Changes
+    runs-on: ubuntu-latest
+    outputs:
+      run_code_jobs: ${{ steps.classify.outputs.run_code_jobs }}
+      run_docs_checks: ${{ steps.classify.outputs.run_docs_checks }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          run_code_jobs=true
+          run_docs_checks=true
+
+          case "${EVENT_NAME}" in
+            pull_request)
+              base_sha="${PR_BASE_SHA}"
+              head_sha="${PR_HEAD_SHA}"
+              diff_mode="merge-base"
+              ;;
+            push)
+              base_sha="${PUSH_BEFORE_SHA}"
+              head_sha="${PUSH_HEAD_SHA}"
+              diff_mode="direct"
+              ;;
+            *)
+              base_sha=""
+              head_sha=""
+              diff_mode=""
+              ;;
+          esac
+
+          if [[ -n "${base_sha}" && -n "${head_sha}" && "${base_sha}" != "0000000000000000000000000000000000000000" ]]; then
+            if [[ "${diff_mode}" == "merge-base" ]]; then
+              mapfile -t changed_files < <(git diff --name-only "${base_sha}...${head_sha}")
+            else
+              mapfile -t changed_files < <(git diff --name-only "${base_sha}" "${head_sha}")
+            fi
+
+            if [[ ${#changed_files[@]} -gt 0 ]]; then
+              run_code_jobs=false
+              run_docs_checks=false
+
+              for file in "${changed_files[@]}"; do
+                [[ -z "${file}" ]] && continue
+                echo "changed: ${file}"
+
+                if [[ ! "${file}" =~ (^docs/)|(\.md$)|(\.mdx$)|(^LICENSE$)|(^\.github/ISSUE_TEMPLATE/) ]]; then
+                  run_code_jobs=true
+                fi
+
+                if [[ "${file}" =~ (^docs/)|(^\.github/scripts/check-cli-doc-flags\.sh$)|(^crates/nono-cli/src/cli\.rs$) ]]; then
+                  run_docs_checks=true
+                fi
+              done
+            fi
+          fi
+
+          echo "run_code_jobs=${run_code_jobs}" >> "${GITHUB_OUTPUT}"
+          echo "run_docs_checks=${run_docs_checks}" >> "${GITHUB_OUTPUT}"
+
   test:
     name: Test
-    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') }}
+    needs: changes
+    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') && needs.changes.outputs.run_code_jobs == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -31,9 +104,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: |
             ~/.cargo/registry
@@ -51,6 +126,8 @@ jobs:
 
   fmt:
     name: Rustfmt
+    needs: changes
+    if: ${{ needs.changes.outputs.run_code_jobs == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -58,6 +135,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
+          toolchain: stable
           components: rustfmt
 
       - name: Check formatting
@@ -65,7 +143,8 @@ jobs:
 
   ffi-header:
     name: Verify FFI Header
-    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') }}
+    needs: changes
+    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') && needs.changes.outputs.run_code_jobs == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -75,6 +154,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
 
       - name: Build nono-ffi (regenerates header)
         run: cargo build -p nono-ffi
@@ -89,7 +170,8 @@ jobs:
 
   clippy:
     name: Clippy
-    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') }}
+    needs: changes
+    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') && needs.changes.outputs.run_code_jobs == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -105,6 +187,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
+          toolchain: stable
           components: clippy
 
       - name: Run Clippy
@@ -112,16 +195,19 @@ jobs:
 
   integration:
     name: Integration Tests
-    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') }}
+    needs: changes
+    if: ${{ !startsWith(github.head_ref, 'dependabot/github_actions/') && needs.changes.outputs.run_code_jobs == 'true' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: |
             ~/.cargo/registry
@@ -144,12 +230,16 @@ jobs:
 
   audit:
     name: Cargo Audit
+    needs: changes
+    if: ${{ needs.changes.outputs.run_code_jobs == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
@@ -159,6 +249,8 @@ jobs:
 
   docs-checks:
     name: Docs Checks
+    needs: changes
+    if: ${{ needs.changes.outputs.run_docs_checks == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

@@ -19,42 +19,40 @@ use std::path::{Path, PathBuf};
 /// Checks `root` for `trust-policy.json`, then user config dir, merging if both
 /// exist. Falls back to default policy (deny enforcement) if none found.
 ///
-/// When `trust_override` is false, each discovered policy file must have a valid
-/// `.bundle` sidecar with a verified signature. Unsigned or tampered policies
-/// are rejected.
+/// When `trust_override` is false, discovered policy files are verified lazily:
+/// the scan first checks whether the current tree contains any signed trust
+/// artifacts that require cryptographic verification. This avoids unnecessary
+/// keystore access in directories that only contain unsigned files, or no trust
+/// artifacts at all.
 ///
 /// # Errors
 ///
 /// Returns `NonoError::TrustPolicy` if a found policy file is malformed, or
 /// `NonoError::TrustVerification` if signature verification fails.
-pub fn load_scan_policy(root: &Path, trust_override: bool) -> Result<TrustPolicy> {
+pub fn load_scan_policy(
+    root: &Path,
+    trust_override: bool,
+    skip_dirs: &[String],
+) -> Result<TrustPolicy> {
     let cwd_policy = root.join("trust-policy.json");
+    let project_policy_path = cwd_policy.exists().then_some(cwd_policy);
 
-    let project = if cwd_policy.exists() {
-        if !trust_override {
-            verify_policy_signature(&cwd_policy)?;
-        }
-        Some(trust::load_policy_from_file(&cwd_policy)?)
+    let project = if let Some(ref policy_path) = project_policy_path {
+        Some(trust::load_policy_from_file(policy_path)?)
     } else {
         None
     };
 
-    let user_path = dirs::config_dir().map(|d| d.join("nono").join("trust-policy.json"));
+    let user_path = crate::trust_cmd::user_trust_policy_path();
+    let user_policy_path = user_path.as_ref().filter(|path| path.exists());
 
-    let user = if let Some(ref path) = user_path {
-        if path.exists() {
-            if !trust_override {
-                verify_policy_signature(path)?;
-            }
-            Some(trust::load_policy_from_file(path)?)
-        } else {
-            None
-        }
+    let user = if let Some(path) = user_policy_path {
+        Some(trust::load_policy_from_file(path)?)
     } else {
         None
     };
 
-    match (user, project) {
+    let effective = match (user, project) {
         (Some(u), Some(p)) => trust::merge_policies(&[u, p]),
         (Some(u), None) => Ok(u),
         (None, Some(p)) => {
@@ -80,7 +78,56 @@ pub fn load_scan_policy(root: &Path, trust_override: bool) -> Result<TrustPolicy
             Ok(p)
         }
         (None, None) => Ok(TrustPolicy::default()),
+    }?;
+
+    if !trust_override && scan_has_signed_artifacts(root, &effective, skip_dirs)? {
+        verify_scan_policy_signatures(
+            project_policy_path.as_deref(),
+            user_policy_path.map(PathBuf::as_path),
+        )?;
     }
+
+    Ok(effective)
+}
+
+/// Return whether the current scan root contains any signed trust artifacts.
+///
+/// This probes for per-file `.bundle` sidecars for included files and for the
+/// multi-subject `.nono-trust.bundle`. Unsigned files are still scanned later,
+/// but they do not require keystore access up front.
+fn scan_has_signed_artifacts(
+    scan_root: &Path,
+    policy: &TrustPolicy,
+    skip_dirs: &[String],
+) -> Result<bool> {
+    if trust::multi_subject_bundle_path(scan_root).exists() {
+        return Ok(true);
+    }
+
+    if policy.includes.is_empty() {
+        return Ok(false);
+    }
+
+    let files = trust::find_included_files_with_skip_dirs(policy, scan_root, skip_dirs)?;
+    Ok(files
+        .iter()
+        .any(|file_path| trust::bundle_path_for(file_path).exists()))
+}
+
+/// Verify any trust policies already discovered for the current scan.
+fn verify_scan_policy_signatures(
+    project_policy_path: Option<&Path>,
+    user_policy_path: Option<&Path>,
+) -> Result<()> {
+    if let Some(policy_path) = project_policy_path {
+        verify_policy_signature(policy_path)?;
+    }
+
+    if let Some(policy_path) = user_policy_path {
+        verify_policy_signature(policy_path)?;
+    }
+
+    Ok(())
 }
 
 /// Verify that a trust policy file has a valid cryptographic signature.
@@ -108,9 +155,20 @@ pub fn verify_policy_signature(policy_path: &Path) -> Result<()> {
     let bundle_path = trust::bundle_path_for(policy_path);
 
     if !bundle_path.exists() {
+        let is_user_policy = crate::trust_cmd::user_trust_policy_path()
+            .map(|p| p == policy_path)
+            .unwrap_or(false);
+        let hint = if is_user_policy {
+            "Run 'nono trust sign-policy --user' to sign it.".to_string()
+        } else {
+            format!(
+                "Run 'nono trust sign-policy {}' to sign it.",
+                policy_path.display()
+            )
+        };
         return Err(nono::NonoError::TrustVerification {
             path: policy_path.display().to_string(),
-            reason: "trust policy is unsigned (no .bundle sidecar found)".to_string(),
+            reason: format!("trust policy is unsigned (no .bundle sidecar found). {hint}"),
         });
     }
 
@@ -213,6 +271,7 @@ pub fn verify_policy_signature(policy_path: &Path) -> Result<()> {
 }
 
 /// Result of a pre-exec trust scan.
+#[derive(Debug)]
 pub struct ScanResult {
     /// Individual file verification results
     pub results: Vec<VerificationResult>,
@@ -233,8 +292,9 @@ impl ScanResult {
 
     /// Collect the absolute paths of all verified instruction files.
     ///
-    /// These paths are used on macOS to inject literal `(allow file-read-data ...)`
-    /// rules that override the deny-regex for instruction file patterns.
+    /// These paths are used to write-protect verified files (literal
+    /// `(deny file-write-data ...)` rules on macOS) and to add read-only
+    /// capabilities so both platforms treat them as immutable.
     #[must_use]
     pub fn verified_paths(&self) -> Vec<PathBuf> {
         self.results
@@ -265,10 +325,26 @@ pub fn run_pre_exec_scan(
     scan_root: &Path,
     policy: &TrustPolicy,
     silent: bool,
+    skip_dirs: &[String],
 ) -> Result<ScanResult> {
-    let files = trust::find_instruction_files(policy, scan_root)?;
     let multi_bundle = trust::multi_subject_bundle_path(scan_root);
     let has_multi_bundle = multi_bundle.exists();
+    if policy.includes.is_empty() && !has_multi_bundle {
+        return Ok(ScanResult {
+            results: Vec::new(),
+            verified: 0,
+            blocked: 0,
+            warned: 0,
+        });
+    }
+
+    let files = trust::find_included_files_with_skip_dirs(policy, scan_root, skip_dirs)?;
+
+    // Check for literal patterns (no glob characters) that matched zero files.
+    // A missing literal file is a security concern: on macOS, there is no
+    // runtime interception, so the agent could create the file mid-session
+    // with arbitrary content and read it as if it were trusted.
+    check_missing_literal_patterns(policy, scan_root, &files, silent)?;
 
     if files.is_empty() && !has_multi_bundle {
         return Ok(ScanResult {
@@ -357,6 +433,110 @@ pub fn run_pre_exec_scan(
         blocked,
         warned,
     })
+}
+
+/// Returns true if a pattern contains glob metacharacters (`*`, `?`, `[`, `{`).
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?') || pattern.contains('[') || pattern.contains('{')
+}
+
+/// Check that every literal (non-glob) pattern in the trust policy has at least
+/// one matching file on disk.
+///
+/// This check only applies on macOS, where there is no runtime file-open
+/// interception. On Linux, seccomp-notify traps every `openat()` and verifies
+/// files on first open, so a missing file at startup is safely handled at
+/// runtime.
+///
+/// On macOS with `deny` enforcement, missing literal files abort startup.
+/// With `warn`/`audit` enforcement, a warning is printed.
+fn check_missing_literal_patterns(
+    policy: &TrustPolicy,
+    scan_root: &Path,
+    found_files: &[PathBuf],
+    silent: bool,
+) -> Result<()> {
+    // On Linux, seccomp-notify provides runtime interception for files that
+    // appear mid-session, so missing files at startup are not a security issue.
+    if cfg!(target_os = "linux") {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+
+    let mut has_globs = false;
+
+    for pattern in &policy.includes {
+        if is_glob_pattern(pattern) {
+            has_globs = true;
+            continue;
+        }
+
+        // Literal pattern — check if the file exists under scan_root
+        let expected = scan_root.join(pattern);
+        let matched = found_files.iter().any(|f| f == &expected);
+
+        if !matched && !expected.exists() {
+            missing.push(pattern.clone());
+        }
+    }
+
+    if has_globs && policy.enforcement.is_blocking() && !silent {
+        eprintln!(
+            "  {}",
+            "Note: glob patterns in 'includes' only match files present at startup on macOS."
+                .yellow()
+        );
+        eprintln!(
+            "  {}",
+            "Files created mid-session matching these patterns will not be verified.".yellow()
+        );
+        eprintln!(
+            "  {}",
+            "Use literal paths for files that must always be verified, or use Linux for runtime interception."
+                .yellow()
+        );
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    match policy.enforcement {
+        nono::trust::Enforcement::Deny => Err(nono::NonoError::TrustVerification {
+            path: missing.join(", "),
+            reason: format!(
+                "literal pattern(s) in trust policy have no matching file. \
+                 On macOS, missing files could be created mid-session with untrusted content \
+                 (no runtime interception). \
+                 Remove the pattern from includes or create and sign the file(s): {}",
+                missing.join(", ")
+            ),
+        }),
+        _ => {
+            if !silent {
+                for m in &missing {
+                    eprintln!(
+                        "  {} pattern '{}' has no matching file",
+                        "Warning:".yellow(),
+                        m
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Public entry point for missing-literal checks, used by CLI commands
+/// (`trust verify --all`, `trust list`) to match `nono run` enforcement.
+pub fn check_missing_literals(
+    policy: &TrustPolicy,
+    scan_root: &Path,
+    found_files: &[PathBuf],
+    silent: bool,
+) -> Result<()> {
+    check_missing_literal_patterns(policy, scan_root, found_files, silent)
 }
 
 /// Verify a single instruction file against the trust policy.
@@ -814,7 +994,7 @@ mod tests {
     fn scan_empty_dir_returns_empty_result() {
         let dir = tempfile::tempdir().unwrap();
         let policy = TrustPolicy::default();
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         assert!(result.should_proceed());
         assert_eq!(result.verified, 0);
         assert_eq!(result.blocked, 0);
@@ -823,17 +1003,84 @@ mod tests {
     }
 
     #[test]
+    fn scan_has_signed_artifacts_ignores_unsigned_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_name = "arbitrary-instructions.txt";
+        std::fs::write(dir.path().join(file_name), "content").unwrap();
+
+        let policy = TrustPolicy {
+            includes: vec![file_name.to_string()],
+            ..TrustPolicy::default()
+        };
+
+        let has_signed_artifacts = scan_has_signed_artifacts(dir.path(), &policy, &[]).unwrap();
+        assert!(!has_signed_artifacts);
+    }
+
+    #[test]
+    fn scan_has_signed_artifacts_empty_policy_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SKILLS.md"), "content").unwrap();
+
+        let has_signed_artifacts =
+            scan_has_signed_artifacts(dir.path(), &TrustPolicy::default(), &[]).unwrap();
+
+        assert!(!has_signed_artifacts);
+    }
+
+    #[test]
+    fn scan_has_signed_artifacts_detects_per_file_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_name = "arbitrary-instructions.txt";
+        let file_path = dir.path().join(file_name);
+        std::fs::write(&file_path, "content").unwrap();
+
+        let key_pair = trust::generate_signing_key().unwrap();
+        let key_id = trust::key_id_hex(&key_pair).unwrap();
+        let bundle_json = trust::sign_instruction_file(&file_path, &key_pair, &key_id).unwrap();
+        std::fs::write(trust::bundle_path_for(&file_path), bundle_json).unwrap();
+
+        let policy = TrustPolicy {
+            includes: vec![file_name.to_string()],
+            ..TrustPolicy::default()
+        };
+
+        let has_signed_artifacts = scan_has_signed_artifacts(dir.path(), &policy, &[]).unwrap();
+        assert!(has_signed_artifacts);
+    }
+
+    #[test]
+    fn run_pre_exec_scan_respects_skip_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("generated")).unwrap();
+        std::fs::write(dir.path().join("generated").join("SKILLS.md"), "generated").unwrap();
+        std::fs::write(dir.path().join("SKILLS.md"), "root").unwrap();
+
+        let policy = TrustPolicy {
+            includes: vec!["SKILLS*".to_string()],
+            enforcement: Enforcement::Audit,
+            ..TrustPolicy::default()
+        };
+
+        let result =
+            run_pre_exec_scan(dir.path(), &policy, true, &[String::from("generated")]).unwrap();
+
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].path, dir.path().join("SKILLS.md"));
+    }
+
+    #[test]
     fn scan_unsigned_file_warn_enforcement_proceeds() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("SKILLS.md"), "# Skills").unwrap();
 
         let policy = TrustPolicy {
-            instruction_patterns: vec!["SKILLS.md".to_string()],
+            includes: vec!["SKILLS.md".to_string()],
             enforcement: Enforcement::Warn,
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         assert!(result.should_proceed());
         assert_eq!(result.verified, 0);
         assert_eq!(result.warned, 1);
@@ -845,12 +1092,12 @@ mod tests {
         std::fs::write(dir.path().join("CLAUDE.md"), "# Claude").unwrap();
 
         let policy = TrustPolicy {
-            instruction_patterns: vec!["CLAUDE.md".to_string()],
+            includes: vec!["CLAUDE.md".to_string()],
             enforcement: Enforcement::Deny,
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         assert!(!result.should_proceed());
         assert_eq!(result.blocked, 1);
     }
@@ -864,7 +1111,7 @@ mod tests {
         let digest = trust::bytes_digest(content);
 
         let policy = TrustPolicy {
-            instruction_patterns: vec!["SKILLS.md".to_string()],
+            includes: vec!["SKILLS.md".to_string()],
             enforcement: Enforcement::Audit, // Even audit blocks blocklisted files
             blocklist: trust::Blocklist {
                 digests: vec![trust::BlocklistEntry {
@@ -877,7 +1124,7 @@ mod tests {
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         assert!(!result.should_proceed());
         assert_eq!(result.blocked, 1);
     }
@@ -889,12 +1136,12 @@ mod tests {
         std::fs::write(dir.path().join("CLAUDE.md"), "# Claude").unwrap();
 
         let policy = TrustPolicy {
-            instruction_patterns: vec!["SKILLS.md".to_string(), "CLAUDE.md".to_string()],
+            includes: vec!["SKILLS.md".to_string(), "CLAUDE.md".to_string()],
             enforcement: Enforcement::Audit,
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         assert!(result.should_proceed());
         assert_eq!(result.warned, 2);
     }
@@ -954,15 +1201,56 @@ mod tests {
     #[test]
     fn load_scan_policy_with_trust_override_skips_verification() {
         let dir = tempfile::tempdir().unwrap();
+        // Isolate from the real user config dir so a stale trust-policy.json
+        // on the developer's machine doesn't interfere with the test.
+        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let xdg_dir = dir.path().join("xdg");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
+
         // Create a policy file with no .bundle — should still load with trust_override=true
         std::fs::write(
             dir.path().join("trust-policy.json"),
-            r#"{"version":1,"instruction_patterns":["SKILLS*","CLAUDE*"],"publishers":[],"blocklist":{"digests":[],"publishers":[]},"enforcement":"warn"}"#,
+            r#"{"version":1,"includes":["SKILLS*","CLAUDE*"],"publishers":[],"blocklist":{"digests":[],"publishers":[]},"enforcement":"warn"}"#,
         )
         .unwrap();
 
-        let policy = load_scan_policy(dir.path(), true).unwrap();
+        let policy = load_scan_policy(dir.path(), true, &[]).unwrap();
         assert_eq!(policy.enforcement, Enforcement::Warn);
+
+        match orig_xdg {
+            Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    fn load_scan_policy_skips_policy_verification_without_signed_artifacts() {
+        let scan_dir = tempfile::tempdir().unwrap();
+        let include_pattern = "*.arbitrary";
+        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let xdg_dir = scan_dir.path().join("xdg");
+        std::fs::create_dir_all(&xdg_dir).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
+
+        std::fs::write(scan_dir.path().join("notes.arbitrary"), "unsigned").unwrap();
+
+        let project_policy_path = scan_dir.path().join("trust-policy.json");
+        std::fs::write(
+            &project_policy_path,
+            format!(
+                r#"{{"version":1,"includes":["{include_pattern}"],"publishers":[],"blocklist":{{"digests":[],"publishers":[]}},"enforcement":"warn"}}"#
+            ),
+        )
+        .unwrap();
+
+        let policy = load_scan_policy(scan_dir.path(), false, &[]).unwrap();
+        assert!(policy.includes.contains(&include_pattern.to_string()));
+
+        match orig_xdg {
+            Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
     }
 
     #[test]
@@ -1005,7 +1293,7 @@ mod tests {
         std::fs::write(&bundle_path, &bundle_json).unwrap();
 
         let policy = TrustPolicy {
-            instruction_patterns: Vec::new(), // no instruction patterns — multi-subject only
+            includes: Vec::new(), // no instruction patterns — multi-subject only
             enforcement: Enforcement::Deny,
             publishers: vec![trust::Publisher {
                 name: "test".to_string(),
@@ -1020,7 +1308,7 @@ mod tests {
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         assert!(result.should_proceed());
         assert_eq!(result.verified, 2);
         assert_eq!(result.blocked, 0);
@@ -1054,7 +1342,7 @@ mod tests {
         std::fs::write(dir.path().join("b.py"), b"TAMPERED").unwrap();
 
         let policy = TrustPolicy {
-            instruction_patterns: Vec::new(),
+            includes: Vec::new(),
             enforcement: Enforcement::Deny,
             publishers: vec![trust::Publisher {
                 name: "test".to_string(),
@@ -1069,7 +1357,7 @@ mod tests {
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         // a.md verified, b.py mismatch
         assert_eq!(result.verified, 1);
         assert_eq!(result.blocked, 1);
@@ -1099,7 +1387,7 @@ mod tests {
         std::fs::write(trust::multi_subject_bundle_path(dir.path()), &bundle_json).unwrap();
 
         let policy = TrustPolicy {
-            instruction_patterns: Vec::new(),
+            includes: Vec::new(),
             enforcement: Enforcement::Deny,
             publishers: vec![trust::Publisher {
                 name: "test".to_string(),
@@ -1114,7 +1402,7 @@ mod tests {
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         assert_eq!(result.verified, 1); // a.md passes
         assert_eq!(result.blocked, 1); // b.py missing = fail
     }
@@ -1137,7 +1425,7 @@ mod tests {
         std::fs::write(trust::multi_subject_bundle_path(dir.path()), &bundle_json).unwrap();
 
         let policy = TrustPolicy {
-            instruction_patterns: Vec::new(),
+            includes: Vec::new(),
             enforcement: Enforcement::Deny,
             publishers: vec![trust::Publisher {
                 name: "test".to_string(),
@@ -1152,7 +1440,7 @@ mod tests {
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         let paths = result.verified_paths();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], dir.path().join("script.py"));
@@ -1180,7 +1468,7 @@ mod tests {
         let other_pub_b64 = nono::trust::base64::base64_encode(other_pub_bytes.as_bytes());
 
         let policy = TrustPolicy {
-            instruction_patterns: Vec::new(),
+            includes: Vec::new(),
             enforcement: Enforcement::Deny,
             publishers: vec![trust::Publisher {
                 name: "other".to_string(),
@@ -1195,7 +1483,7 @@ mod tests {
             ..TrustPolicy::default()
         };
 
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         // Crypto verification will fail (wrong key), so blocked
         assert!(!result.should_proceed());
         assert_eq!(result.blocked, 1);
@@ -1208,8 +1496,90 @@ mod tests {
         std::fs::write(dir.path().join("src.rs"), "fn main() {}").unwrap();
 
         let policy = TrustPolicy::default();
-        let result = run_pre_exec_scan(dir.path(), &policy, true).unwrap();
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]).unwrap();
         assert!(result.should_proceed());
         assert!(result.results.is_empty());
+    }
+
+    #[test]
+    fn missing_literal_pattern_blocks_with_deny_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        // SKILLS.md is listed in the policy but does not exist on disk
+        let policy = TrustPolicy {
+            includes: vec!["SKILLS.md".to_string()],
+            enforcement: Enforcement::Deny,
+            ..TrustPolicy::default()
+        };
+
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]);
+
+        if cfg!(target_os = "linux") {
+            assert!(result.is_ok());
+            return;
+        }
+
+        match result {
+            Err(err) => {
+                let err = err.to_string();
+                assert!(err.contains("SKILLS.md"));
+                assert!(err.contains("no matching file"));
+            }
+            Ok(_) => panic!("expected missing literal includes to block startup on this platform"),
+        }
+    }
+
+    #[test]
+    fn missing_literal_pattern_warns_with_warn_enforcement() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = TrustPolicy {
+            includes: vec!["SKILLS.md".to_string()],
+            enforcement: Enforcement::Warn,
+            ..TrustPolicy::default()
+        };
+
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn glob_pattern_with_no_matches_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        // Glob pattern — absence just means "no current matches"
+        let policy = TrustPolicy {
+            includes: vec!["SKILLS*".to_string()],
+            enforcement: Enforcement::Deny,
+            ..TrustPolicy::default()
+        };
+
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn literal_pattern_present_on_disk_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SKILLS.md"), "# Skills").unwrap();
+
+        let policy = TrustPolicy {
+            includes: vec!["SKILLS.md".to_string()],
+            enforcement: Enforcement::Deny,
+            ..TrustPolicy::default()
+        };
+
+        // This will fail at verification (unsigned), not at the missing-file check.
+        // The point is: the literal check itself passes because the file exists.
+        let result = run_pre_exec_scan(dir.path(), &policy, true, &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn is_glob_pattern_classification() {
+        assert!(!is_glob_pattern("SKILLS.md"));
+        assert!(!is_glob_pattern(".claude/commands/deploy.md"));
+        assert!(is_glob_pattern("SKILLS*"));
+        assert!(is_glob_pattern("CLAUDE*.md"));
+        assert!(is_glob_pattern(".claude/**/*.md"));
+        assert!(is_glob_pattern("test[0-9].md"));
+        assert!(is_glob_pattern("{a,b}.md"));
     }
 }

@@ -19,8 +19,8 @@
   <a href="https://discord.gg/pPcjYzGvbS">
     <img src="https://img.shields.io/badge/Chat-Join%20Discord-7289da?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord"/>
   </a>
-  <a href="https://github.com/marketplace/actions/nono-attest">
-    <img src="https://img.shields.io/badge/Secure_Action-nono--attest-2088FF?style=for-the-badge&logo=github-actions&logoColor=white" alt="nono-attest GitHub Action"/>
+  <a href="https://github.com/marketplace/actions/agent-sign">
+    <img src="https://img.shields.io/badge/Secure_Action-agent--sign-2088FF?style=for-the-badge&logo=github-actions&logoColor=white" alt="agent-sign GitHub Action"/>
   </a>
 </p>
 
@@ -29,12 +29,15 @@
 > [!WARNING]
 > This is an early alpha release that has not undergone comprehensive security audits. While we have taken care to implement robust security measures, there may still be undiscovered issues. We do not recommend using this in production until we release a stable version of 1.0.
 
-> [!NOTE]
-> See our [latest release](https://github.com/always-further/nono/releases/latest) or [CHANGELOG.md](./CHANGELOG.md) for release notes.
+> [!IMPORTANT]
+> Active development may cause disruptions — if something is broken, it's likely us, not you.
+> - **Supervisor:** Work is underway on a runtime lifecycle making the supervisor the default execution mode, introducing commands like `ps`, `attach`, `detach`, `inspect`, and `stop`. [#502](https://github.com/always-further/nono/discussions/502)
+> - **Packages & Skills:** A system for customized hooks, skills, and scripts for Coding Agents — with a community registry or any git repo as a source. [#459](https://github.com/always-further/nono/issues/459)
+> - **Policy:** Work continues to make everything fully composable and group-based. [#446](https://github.com/always-further/nono/issues/446)
+
+---
 
 AI agents get filesystem access, run shell commands, and are wide open to prompt injections. The standard response is guardrails and policies. The problem is that policies can be bypassed — and guardrails can be talked out of.
-
-Security is a structural problem. You can't prompt-engineer your way to safety and software guardrails don't work, yet you don't want to spend time dealing with docker volume mounts, or setting up a hypervisor.
 
 With nono, you don't have to. nono wraps your agent in a kernel-isolated sandbox in seconds — with API key protection, destructive action guardrails, and full snapshot/rollback built in. No hypervisor to configure. No container volume mounts. Zero latency overhead.
 
@@ -50,6 +53,9 @@ brew install nono
 **Other install options**
 
 Prebuilt binaries and package manager instructions are in the [Installation Guide](https://docs.nono.sh/cli/getting_started/installation).
+
+---
+
 ## CLI
 
 The CLI is the quickest way to get going! zero startup latency, no need to install hypervisors, runtimes, mount volumes...sandboxed and protected in a single command
@@ -69,33 +75,11 @@ nono run --allow-cwd -- npx @anthropic/agent-framework
 nono run --read /data -- npx @modelcontextprotocol/server-filesystem /data
 nono run --profile pydantic-ai-agent --allow logs/ -- uv run my_agent.py
 nono run --profile custom-profile -- node agent.js
-
-# Rollback snapshots — undo everything the agent did
-nono run --rollback --profile claude-code --allow-cwd -- claude
-
-# Combine rollback, network filtering, and port binding
-nono run --rollback --allow-proxy api.anthropic.ai --allow-port 8000 -- uv run uvicorn myagent.main:app --port 8000
-
-# Network proxy — allowlist hosts, inject credentials without exposing keys
-nono run --allow-proxy api.openai.com --proxy-credential openai -- python3 agent.py
-
-# Audit trail on every session — opt out with --no-audit
-nono run --no-audit --allow-cwd -- npm test
-
-# Direct exec for scripts and piping (no parent process)
-nono wrap --read ./src --write ./output -- cargo build
-
-# Need a profile automatically applied for a specific client?
-nono learn -- new-cool-coding-agent
-
-# Why did you block that command? 
-nono why --path ~/.ssh/id_rsa
-DENIED
-  Reason: sensitive_path
-  Details: Path matches sensitive pattern 'Block access to cryptographic keys, tokens, and cloud credentials'. Access blocked by security policy.
 ```
 
 Built-in profiles for [Claude Code](https://docs.nono.sh/cli/clients/claude-code), [Codex](https://docs.nono.sh/cli/clients/codex), [OpenCode](https://docs.nono.sh/cli/clients/opencode), [OpenClaw](https://docs.nono.sh/cli/clients/openclaw), and [Swival](https://docs.nono.sh/cli/clients/swival) — or define your own with custom permissions.
+
+---
 
 ## Library
 
@@ -136,6 +120,8 @@ caps.allowPath("/tmp/workspace", AccessMode.ReadWrite);
 
 apply(caps);  // Irreversible — kernel-enforced from here on
 ```
+
+---
 
 ## Features
 
@@ -240,7 +226,7 @@ Security policy defined as named groups in a single JSON file. Profiles referenc
 
 ### Destructive Command Blocking
 
-Dangerous commands (`rm`, `dd`, `chmod`, `sudo`, `scp`) are blocked before execution. Override per invocation with `--allow-command` or permanently via `allowed_commands` in a profile.
+Dangerous commands (`rm`, `dd`, `chmod`, `sudo`, `scp`) are blocked before execution. Override per invocation with `--allow-command` or permanently via `allowed_commands` in a profile. Block additional commands with `add_deny_commands`.
 
 ```bash
 $ nono run --allow-cwd -- rm -rf /
@@ -252,6 +238,10 @@ nono run --allow-cwd --allow-command rm -- rm ./temp-file.txt
 # Override via profile
 # { "security": { "allowed_commands": ["rm"] } }
 nono run --profile my-profile -- rm /tmp/old-file.txt
+
+# Block specific commands in a profile (add_deny_commands) — pairs with add_deny_access for sockets
+# { "policy": { "add_deny_access": ["/var/run/docker.sock"], "add_deny_commands": ["docker", "kubectl"] } }
+nono run --profile no-docker -- claude
 ```
 
 > [!WARNING]
@@ -319,7 +309,7 @@ nono ships with built-in profiles for popular AI coding agents. Each profile def
 | **OpenClaw** | `openclaw` | [Guide](https://docs.nono.sh/cli/clients/openclaw) |
 | **Swival** | `swival` | [Guide](https://docs.nono.sh/cli/clients/swival) |
 
-Custom profiles can [extend built-in ones](https://docs.nono.sh/cli/features/profiles-groups) with `"extends": "claude-code"` to inherit all settings and add overrides. nono is agent-agnostic and works with any CLI command. See the [full documentation](https://docs.nono.sh) for usage details, configuration, and integration guides.
+Custom profiles can [extend built-in ones](https://docs.nono.sh/cli/features/profiles-groups) with `"extends": "claude-code"` (or multiple: `"extends": ["claude-code", "node-dev"]`) to inherit all settings and add overrides. nono is agent-agnostic and works with any CLI command. See the [full documentation](https://docs.nono.sh) for usage details, configuration, and integration guides.
 
 ## Projects using nono
 
@@ -348,7 +338,7 @@ We encourage using AI tools to contribute to nono. However, you must understand 
 
 ## Security
 
-If you discover a security vulnerability, please **do not open a public issue**. Instead, follow the responsible disclosure process outlined in our [Security Policy](https://github.com/always-further/nono/blob/main/SECURITY.md).
+If you discover a security vulnerability, please **do not open a public issue**. Instead, follow the responsible disclosure process outlined in our [Security Policy](https://github.com/always-further/nono/security).
 
 ## License
 
