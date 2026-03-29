@@ -30,6 +30,7 @@
         "pages": [
           "cli/getting_started/installation",
           "cli/getting_started/quickstart",
+          "cli/usage/developer-workflows",
           "cli/usage/examples",
           "cli/usage/troubleshooting"
         ]
@@ -37,6 +38,7 @@
       {
         "group": "Features",
         "pages": [
+          "cli/features/session-lifecycle",
           "cli/features/profiles-groups",
           "cli/features/profile-authoring",
           "cli/features/atomic-rollbacks",
@@ -44,7 +46,6 @@
           "cli/features/supervisor",
           "cli/features/networking",
           "cli/features/credential-injection",
-          "cli/features/execution-modes",
           "cli/features/policy-introspection",
           "cli/features/learn",
           "cli/features/trust"
@@ -63,6 +64,7 @@
         "group": "Platform Internals",
         "pages": [
           "cli/internals/index",
+          "cli/features/execution-modes",
           "cli/internals/security-model",
           "cli/internals/landlock",
           "cli/internals/seatbelt",
