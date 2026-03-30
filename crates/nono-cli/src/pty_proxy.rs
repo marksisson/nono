@@ -41,9 +41,9 @@ const ATTACH_ACK_BUSY: u8 = 1;
 const ATTACH_ACK_DENIED: u8 = 2;
 const ATTACH_SCREEN_ENTER_ESCAPE: &[u8] =
     b"\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?1049h\x1b[?25h\x1b[2J\x1b[H";
-const TERMINAL_RESTORE_ESCAPE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h";
+const TERMINAL_RESTORE_ESCAPE: &[u8] = b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h";
 const TERMINAL_RESTORE_AND_CLEAR_ESCAPE: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l\x1b[?25h\x1b[2J\x1b[H";
+    b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l\x1b[?25h\x1b[2J\x1b[H";
 
 /// PTY pair with the attach socket path.
 pub struct PtyPair {
@@ -1621,6 +1621,15 @@ mod tests {
             assert!(esc.contains(&format!("\u{1b}[?{mode}l")));
         }
         assert!(esc.contains("\u{1b}[?1049l"));
+    }
+
+    #[test]
+    fn terminal_restore_escape_disables_keyboard_enhancement_modes() {
+        let esc = std::str::from_utf8(terminal_restore_escape(false)).unwrap_or("");
+        assert!(esc.contains("\u{1b}[<u"));
+        for mode in ["0", "1", "2", "3", "4", "6", "7"] {
+            assert!(esc.contains(&format!("\u{1b}[>{mode}n")));
+        }
     }
 
     #[test]
