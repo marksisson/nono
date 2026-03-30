@@ -808,8 +808,15 @@ pub struct WrapSandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
-    /// Configuration file path
-    #[arg(long, short = 'c', value_name = "FILE", help_heading = "OPTIONS")]
+    /// Capability manifest file (JSON). A fully-resolved sandbox specification —
+    /// conflicts with --allow, --read, --write, and --profile.
+    #[arg(
+        long,
+        short = 'c',
+        value_name = "FILE",
+        conflicts_with_all = &["allow", "read", "write", "allow_file", "read_file", "write_file", "profile"],
+        help_heading = "OPTIONS"
+    )]
     pub config: Option<PathBuf>,
 
     /// Enable verbose output

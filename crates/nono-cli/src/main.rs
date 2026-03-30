@@ -2341,6 +2341,96 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
     }
 
+    // ── Manifest-based path (--config) ────────────────────────────────
+    // When --config is provided, the manifest is the complete sandbox
+    // specification. We skip profile loading, group resolution, CWD
+    // auto-inclusion, and deny overlap validation.
+    //
+    // NOTE: credentials declared in the manifest are NOT yet wired to the
+    // reverse proxy — that requires proxy startup logic from the profile
+    // path. For now, --config only handles filesystem, network mode/ports,
+    // and process isolation. Credential proxy support is future work.
+    if let Some(ref config_path) = args.config {
+        let json = std::fs::read_to_string(config_path).map_err(|e| {
+            NonoError::ConfigParse(format!(
+                "failed to read manifest file '{}': {e}",
+                config_path.display()
+            ))
+        })?;
+        let mut manifest = nono::manifest::CapabilityManifest::from_json(&json)?;
+        manifest.validate()?;
+
+        // Expand ~, $HOME, $WORKDIR, $TMPDIR etc. in filesystem paths.
+        // This is a CLI convenience — the library receives absolute paths.
+        // For K8s/container use, manifests should contain absolute paths
+        // and this expansion is a no-op.
+        if let Some(ref mut fs) = manifest.filesystem {
+            for grant in &mut fs.grants {
+                let expanded = profile::expand_vars(grant.path.as_str(), &workdir)?;
+                grant.path = expanded
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|e| NonoError::ConfigParse(format!("invalid path: {e}")))?;
+            }
+            for deny in &mut fs.deny {
+                let expanded = profile::expand_vars(deny.path.as_str(), &workdir)?;
+                deny.path = expanded
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|e| NonoError::ConfigParse(format!("invalid path: {e}")))?;
+            }
+        }
+
+        let caps = CapabilitySet::try_from(&manifest)?;
+
+        // Protected roots validation still applies — a manifest should not
+        // grant access to security-critical system paths without warning.
+        let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
+        protected_paths::validate_caps_against_protected_roots(&caps, protected_roots.as_paths())?;
+
+        // Extract rollback config from manifest
+        let (rollback_exclude_patterns, rollback_exclude_globs) =
+            if let Some(ref rb) = manifest.rollback {
+                (rb.exclude_patterns.clone(), rb.exclude_globs.clone())
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+        // Print capability summary
+        output::print_capabilities(&caps, args.verbose, silent);
+
+        #[cfg(target_os = "linux")]
+        output::print_abi_info(silent);
+
+        if !Sandbox::is_supported() {
+            return Err(NonoError::SandboxInit(Sandbox::support_info().details));
+        }
+        info!("{}", Sandbox::support_info().details);
+
+        return Ok(PreparedSandbox {
+            caps,
+            secrets: Vec::new(),
+            rollback_exclude_patterns,
+            rollback_exclude_globs,
+            skip_dirs: Vec::new(),
+            network_profile: None,
+            allow_domain: Vec::new(),
+            credentials: Vec::new(),
+            custom_credentials: std::collections::HashMap::new(),
+            upstream_proxy: None,
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
+            capability_elevation: false,
+            #[cfg(target_os = "linux")]
+            wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::default(),
+            allow_launch_services_active: false,
+            open_url_origins: Vec::new(),
+            open_url_allow_localhost: false,
+            override_deny_paths: Vec::new(),
+        });
+    }
+
+    // ── Profile / CLI-flag path ─────────────────────────────────────────
     // Build capabilities from profile or arguments.
     // Unlink overrides are deferred so they can cover the CWD path added below.
     let (mut caps, needs_unlink_overrides) = if let Some(ref prof) = loaded_profile {
