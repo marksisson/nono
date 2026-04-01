@@ -43,7 +43,7 @@ With nono, you don't have to. nono wraps your agent in a kernel-isolated sandbox
 
 ---
 
-**Platform support:** macOS and Linux now. Windows coming soon.
+**Platform support:** macOS, Linux, and [WSL2](https://nono.sh/docs/cli/internals/wsl2). Native Windows coming soon.
 
 **Homebrew (macOS/Linux)**
 ```bash
