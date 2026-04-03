@@ -339,13 +339,13 @@ fn resolve_single_group(
     // Process allow operations
     if let Some(allow) = &group.allow {
         for path_str in &allow.read {
-            add_fs_capability(path_str, AccessMode::Read, &source, caps)?;
+            add_fs_capability(group_name, path_str, AccessMode::Read, &source, caps)?;
         }
         for path_str in &allow.write {
-            add_fs_capability(path_str, AccessMode::Write, &source, caps)?;
+            add_fs_capability(group_name, path_str, AccessMode::Write, &source, caps)?;
         }
         for path_str in &allow.readwrite {
-            add_fs_capability(path_str, AccessMode::ReadWrite, &source, caps)?;
+            add_fs_capability(group_name, path_str, AccessMode::ReadWrite, &source, caps)?;
         }
     }
 
@@ -386,8 +386,48 @@ fn resolve_single_group(
     Ok(needs_unlink_overrides)
 }
 
+fn canonicalize_for_comparison(path: &Path) -> PathBuf {
+    match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Skip implicit Linux temp-root grants that would cover HOME.
+///
+/// Landlock cannot enforce deny paths beneath an allowed parent. When HOME is
+/// nested under `/tmp` or `$TMPDIR`, the broad system temp grants from
+/// `system_write_linux` would silently disable default deny rules such as
+/// `~/.aws` and `~/.bash_history`. In that environment, fail secure by dropping
+/// the broad system grant and requiring explicit user/profile grants instead.
+fn should_skip_group_allow_path(group_name: &str, path: &Path) -> Result<bool> {
+    if !cfg!(target_os = "linux") || group_name != "system_write_linux" || !path.is_dir() {
+        return Ok(false);
+    }
+
+    let home = PathBuf::from(crate::config::validated_home()?);
+    let home_raw_overlaps = home.starts_with(path);
+    let home_canonical = canonicalize_for_comparison(&home);
+    let path_canonical = canonicalize_for_comparison(path);
+    let home_canonical_overlaps = home_canonical.starts_with(&path_canonical);
+
+    if !home_raw_overlaps && !home_canonical_overlaps {
+        return Ok(false);
+    }
+
+    warn!(
+        "Skipping Linux system temp grant '{}' from group '{}' because HOME '{}' is nested \
+         inside it. Landlock cannot enforce deny rules beneath an allowed parent.",
+        path.display(),
+        group_name,
+        home.display()
+    );
+    Ok(true)
+}
+
 /// Add a filesystem capability from a group path, handling expansion and existence checks
 fn add_fs_capability(
+    group_name: &str,
     path_str: &str,
     mode: AccessMode,
     source: &CapabilitySource,
@@ -401,6 +441,10 @@ fn add_fs_capability(
             path_str,
             path.display()
         );
+        return Ok(());
+    }
+
+    if should_skip_group_allow_path(group_name, &path)? {
         return Ok(());
     }
 
@@ -1780,6 +1824,47 @@ mod tests {
         validate_deny_overlaps(&deny_paths, &caps).expect("No overlap should succeed");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_should_skip_system_write_linux_tmp_grant_when_home_is_nested() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let original_home = std::env::var("HOME").ok();
+        let original_tmpdir = std::env::var("TMPDIR").ok();
+
+        let temp_root = tempfile::tempdir().expect("tmpdir");
+        let home = temp_root.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+
+        std::env::set_var("HOME", &home);
+        std::env::set_var("TMPDIR", temp_root.path());
+
+        let skip_tmp = should_skip_group_allow_path("system_write_linux", Path::new("/tmp"))
+            .expect("check /tmp skip");
+        let skip_tmpdir = should_skip_group_allow_path("system_write_linux", temp_root.path())
+            .expect("check TMPDIR skip");
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_tmpdir {
+            Some(value) => std::env::set_var("TMPDIR", value),
+            None => std::env::remove_var("TMPDIR"),
+        }
+
+        assert!(
+            skip_tmp,
+            "/tmp should be skipped when HOME is nested under it"
+        );
+        assert!(
+            skip_tmpdir,
+            "$TMPDIR should be skipped when HOME is nested under it"
+        );
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_validate_deny_overlaps_group_overlap_is_fatal() {
@@ -1852,6 +1937,15 @@ mod tests {
                     let expanded = expand_path(p).unwrap_or_else(|e| {
                         panic!("expand_path({p}) failed in group '{name}': {e}")
                     });
+                    if should_skip_group_allow_path(name, &expanded).unwrap_or_else(|e| {
+                        panic!(
+                            "should_skip_group_allow_path({}, {}) failed: {e}",
+                            name,
+                            expanded.display()
+                        )
+                    }) {
+                        continue;
+                    }
                     allow_paths.push((name.clone(), expanded));
                 }
             }

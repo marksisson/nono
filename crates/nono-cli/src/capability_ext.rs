@@ -544,6 +544,26 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        f()
+    }
+
+    fn from_args_locked(args: &SandboxArgs) -> Result<(CapabilitySet, bool)> {
+        with_env_lock(|| CapabilitySet::from_args(args))
+    }
+
+    fn from_profile_locked(
+        profile: &crate::profile::Profile,
+        workdir: &Path,
+        args: &SandboxArgs,
+    ) -> Result<(CapabilitySet, bool)> {
+        with_env_lock(|| CapabilitySet::from_profile(profile, workdir, args))
+    }
+
     fn sandbox_args() -> SandboxArgs {
         SandboxArgs::default()
     }
@@ -557,7 +577,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) = CapabilitySet::from_args(&args).expect("Failed to build caps");
+        let (caps, _) = from_args_locked(&args).expect("Failed to build caps");
         assert!(caps.has_fs());
         assert!(!caps.is_network_blocked());
     }
@@ -569,7 +589,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) = CapabilitySet::from_args(&args).expect("Failed to build caps");
+        let (caps, _) = from_args_locked(&args).expect("Failed to build caps");
         assert!(caps.is_network_blocked());
     }
 
@@ -582,7 +602,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) = CapabilitySet::from_args(&args).expect("Failed to build caps");
+        let (caps, _) = from_args_locked(&args).expect("Failed to build caps");
         assert!(caps.allowed_commands().contains(&"rm".to_string()));
         assert!(caps.blocked_commands().contains(&"custom".to_string()));
     }
@@ -597,7 +617,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let err = CapabilitySet::from_args(&args).expect_err("must reject protected state path");
+        let err = from_args_locked(&args).expect_err("must reject protected state path");
         assert!(
             err.to_string()
                 .contains("overlaps protected nono state root"),
@@ -607,16 +627,58 @@ mod tests {
 
     #[test]
     fn test_from_args_uses_default_profile_groups_for_runtime_policy() {
-        let args = sandbox_args();
-        let (caps, _) = CapabilitySet::from_args(&args).expect("build caps from args");
+        with_env_lock(|| {
+            let args = sandbox_args();
+            let (caps, _) = CapabilitySet::from_args(&args).expect("build caps from args");
 
-        let policy = crate::policy::load_embedded_policy().expect("load embedded policy");
-        let default_groups = default_profile_groups().expect("get default profile groups");
-        let deny_paths = crate::policy::resolve_deny_paths_for_groups(&policy, &default_groups)
-            .expect("resolve deny paths");
+            let policy = crate::policy::load_embedded_policy().expect("load embedded policy");
+            let default_groups = default_profile_groups().expect("get default profile groups");
+            let deny_paths = crate::policy::resolve_deny_paths_for_groups(&policy, &default_groups)
+                .expect("resolve deny paths");
 
-        crate::policy::validate_deny_overlaps(&deny_paths, &caps)
-            .expect("from_args caps should match default profile deny policy");
+            crate::policy::validate_deny_overlaps(&deny_paths, &caps)
+                .expect("from_args caps should match default profile deny policy");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_from_args_skips_linux_temp_root_when_home_is_nested() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let temp_root = tempdir().expect("tmpdir");
+        let home = temp_root.path().join("home");
+        let allowed = temp_root.path().join("other");
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&allowed).expect("create allowed dir");
+
+        let home_str = home.to_string_lossy().into_owned();
+        let tmpdir_str = temp_root.path().to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home_str.as_str()),
+            ("TMPDIR", tmpdir_str.as_str()),
+        ]);
+
+        let args = SandboxArgs {
+            allow: vec![allowed.clone()],
+            ..sandbox_args()
+        };
+
+        let result = CapabilitySet::from_args(&args);
+
+        let (caps, _) = result.expect(
+            "from_args should succeed when HOME is nested under TMPDIR and the user grants a sibling path",
+        );
+        let allowed_canonical = allowed.canonicalize().expect("canonicalize allowed dir");
+        assert!(
+            caps.fs_capabilities()
+                .iter()
+                .any(|cap| !cap.is_file && cap.resolved == allowed_canonical),
+            "explicit user grant under TMPDIR should still be present"
+        );
     }
 
     #[test]
@@ -637,8 +699,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert!(
             caps.allowed_commands().contains(&"rm".to_string()),
             "profile allowed_commands should include 'rm'"
@@ -669,8 +730,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert!(
             !caps.blocked_commands().contains(&"rm".to_string()),
             "excluded dangerous_commands should remove rm from blocked commands"
@@ -705,8 +765,7 @@ mod tests {
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert!(
             !caps.blocked_commands().contains(&"rm".to_string()),
@@ -751,8 +810,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let read_canonical = read_dir.canonicalize().expect("canonicalize read");
         let write_canonical = write_dir.canonicalize().expect("canonicalize write");
@@ -808,7 +866,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let err = CapabilitySet::from_profile(&profile, workdir.path(), &args)
+        let err = from_profile_locked(&profile, workdir.path(), &args)
             .expect_err("profile deny overlap should fail on linux");
         assert!(
             err.to_string().contains("Landlock deny-overlap"),
@@ -848,7 +906,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let err = CapabilitySet::from_profile(&profile, workdir.path(), &args)
+        let err = from_profile_locked(&profile, workdir.path(), &args)
             .expect_err("symlinked deny overlap should fail on linux");
         assert!(
             err.to_string().contains("Landlock deny-overlap"),
@@ -889,8 +947,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert!(
             !caps
@@ -935,8 +992,7 @@ mod tests {
         let mut args = sandbox_args();
         args.override_deny = vec![target.clone()];
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert!(
             caps.fs_capabilities()
@@ -980,8 +1036,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert!(
             caps.fs_capabilities()
@@ -1012,8 +1067,7 @@ mod tests {
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
 
         let args = sandbox_args();
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let rules = caps.platform_rules().join("\n");
         // On macOS, tempdir is under /var/folders which is a symlink to /private/var/folders.
@@ -1075,8 +1129,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let rules = caps.platform_rules().join("\n");
         assert!(
@@ -1118,8 +1171,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         // The allow should survive because override_deny punches through the deny
         let canonical = denied.canonicalize().expect("canonicalize");
@@ -1160,7 +1212,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let err = CapabilitySet::from_profile(&profile, workdir.path(), &args)
+        let err = from_profile_locked(&profile, workdir.path(), &args)
             .expect_err("override_deny without user-intent grant should fail");
         assert!(
             err.to_string().contains("no matching grant"),
@@ -1177,7 +1229,7 @@ mod tests {
         let args = sandbox_args();
 
         let (mut caps, needs_unlink_overrides) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("Failed to build");
+            from_profile_locked(&profile, workdir.path(), &args).expect("Failed to build");
 
         // Simulate what main.rs does: apply unlink overrides after all paths finalized
         if needs_unlink_overrides {
@@ -1244,8 +1296,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let canonical = target.canonicalize().expect("canonicalize target");
         let cap = caps
@@ -1290,8 +1341,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let canonical = target.canonicalize().expect("canonicalize target");
         let cap = caps
@@ -1318,8 +1368,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert_eq!(*caps.network_mode(), nono::NetworkMode::AllowAll);
     }
@@ -1345,8 +1394,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         assert_eq!(*caps.network_mode(), nono::NetworkMode::AllowAll);
     }
@@ -1367,8 +1415,7 @@ mod tests {
         let workdir = tempdir().expect("tmpdir");
         let args = sandbox_args();
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert_eq!(
             caps.process_info_mode(),
             nono::ProcessInfoMode::AllowSameSandbox,
@@ -1392,8 +1439,7 @@ mod tests {
         let workdir = tempdir().expect("tmpdir");
         let args = sandbox_args();
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert_eq!(
             caps.ipc_mode(),
             nono::IpcMode::Full,
@@ -1417,8 +1463,7 @@ mod tests {
         let workdir = tempdir().expect("tmpdir");
         let args = sandbox_args();
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert_eq!(
             caps.ipc_mode(),
             nono::IpcMode::SharedMemoryOnly,
@@ -1442,8 +1487,7 @@ mod tests {
         let workdir = tempdir().expect("tmpdir");
         let args = sandbox_args();
         let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
         assert_eq!(
             caps.ipc_mode(),
             nono::IpcMode::SharedMemoryOnly,
@@ -1494,8 +1538,7 @@ mod tests {
         let workdir = tempdir().expect("workdir");
         let args = sandbox_args();
 
-        let (caps, _) =
-            CapabilitySet::from_profile(&profile, workdir.path(), &args).expect("build caps");
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
         let ports = caps.tcp_connect_ports();
         assert!(
@@ -1525,7 +1568,7 @@ mod tests {
             ..sandbox_args()
         };
 
-        let (caps, _) = CapabilitySet::from_args(&args).expect("build caps");
+        let (caps, _) = from_args_locked(&args).expect("build caps");
 
         let ports = caps.tcp_connect_ports();
         assert!(
