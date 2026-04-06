@@ -394,30 +394,42 @@ fn download_and_verify_artifacts(
 ) -> Result<Vec<DownloadedArtifact>> {
     let trusted_root = nono::trust::load_production_trusted_root()?;
     let policy = nono::trust::VerificationPolicy::default();
-    let mut downloads = Vec::with_capacity(pull.artifacts.len());
-    let mut expected_signer: Option<SignerIdentity> = None;
+    let bundle_path = Path::new(".nono-trust.bundle");
 
-    for artifact in &pull.artifacts {
-        let bytes = client.download_bytes(&artifact.download_url)?;
-        let bundle_json = client.download_text(&artifact.bundle_url)?;
-        let bundle = nono::trust::load_bundle_from_str(
-            &bundle_json,
-            Path::new(&format!("{}.bundle", artifact.filename)),
-        )?;
+    // Download the single multi-subject bundle for this version
+    let bundle_json = client.download_text(&pull.bundle_url)?;
+    let bundle = nono::trust::load_bundle_from_str(&bundle_json, bundle_path)?;
 
-        nono::trust::verify_bundle_subject_name(&bundle, Path::new(&artifact.filename))?;
-        nono::trust::verify_bundle(
-            &bytes,
+    // Extract all subjects from the bundle for digest matching
+    let subjects = nono::trust::extract_all_subjects(&bundle, bundle_path)?;
+    let subject_digests: std::collections::HashMap<&str, &str> = subjects
+        .iter()
+        .map(|(name, digest)| (digest.as_str(), name.as_str()))
+        .collect();
+
+    // Verify the bundle signature using the first subject's digest
+    if let Some((_, first_digest)) = subjects.first() {
+        nono::trust::verify_bundle_with_digest(
+            first_digest,
             &bundle,
             &trusted_root,
             &policy,
-            Path::new(&artifact.filename),
+            bundle_path,
         )?;
+    } else {
+        return Err(NonoError::PackageVerification {
+            package: package_ref.key(),
+            reason: "bundle contains no subjects".to_string(),
+        });
+    }
 
-        let signer_identity =
-            nono::trust::extract_signer_identity(&bundle, Path::new(&artifact.filename))?;
-        enforce_namespace_assertion(package_ref, &signer_identity)?;
-        enforce_signer_consistency(package_ref, &mut expected_signer, &signer_identity)?;
+    let signer_identity = nono::trust::extract_signer_identity(&bundle, bundle_path)?;
+    enforce_namespace_assertion(package_ref, &signer_identity)?;
+
+    let mut downloads = Vec::with_capacity(pull.artifacts.len());
+
+    for artifact in &pull.artifacts {
+        let bytes = client.download_bytes(&artifact.download_url)?;
 
         let digest = sha256_hex(&bytes);
         if digest != artifact.sha256_digest {
@@ -430,12 +442,23 @@ fn download_and_verify_artifacts(
             });
         }
 
+        // Verify this artifact's digest is a subject in the bundle
+        if !subject_digests.contains_key(digest.as_str()) {
+            return Err(NonoError::PackageVerification {
+                package: package_ref.key(),
+                reason: format!(
+                    "artifact {} digest not found in bundle subjects",
+                    artifact.filename
+                ),
+            });
+        }
+
         downloads.push(DownloadedArtifact {
             filename: artifact.filename.clone(),
             bytes,
             sha256_digest: digest,
-            signer_identity,
-            bundle_json,
+            signer_identity: signer_identity.clone(),
+            bundle_json: bundle_json.clone(),
         });
     }
 
