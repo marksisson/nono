@@ -833,6 +833,10 @@ pub struct SandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
+    /// Allow GPU access on Apple Silicon Macs through IOKit
+    #[arg(long, help_heading = "OPTIONS")]
+    pub allow_gpu: bool,
+
     /// Capability manifest file (JSON). A fully-resolved sandbox specification —
     /// mutually exclusive with all other sandbox configuration flags.
     #[arg(
@@ -845,7 +849,7 @@ pub struct SandboxArgs {
             "block_net", "allow_net", "network_profile", "allow_proxy",
             "allow_bind", "allow_port", "external_proxy", "proxy_port",
             "proxy_credential", "allow_endpoint", "env_credential", "env_credential_map",
-            "allow_command", "block_command", "allow_launch_services",
+            "allow_command", "block_command", "allow_launch_services", "allow_gpu",
         ],
         help_heading = "OPTIONS"
     )]
@@ -990,6 +994,10 @@ pub struct WrapSandboxArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub allow_launch_services: bool,
 
+    /// Allow GPU access on Apple Silicon Macs through IOKit
+    #[arg(long, help_heading = "OPTIONS")]
+    pub allow_gpu: bool,
+
     /// Capability manifest file (JSON). A fully-resolved sandbox specification —
     /// mutually exclusive with all other sandbox configuration flags.
     #[arg(
@@ -1001,7 +1009,7 @@ pub struct WrapSandboxArgs {
             "profile", "override_deny", "allow_cwd",
             "block_net", "allow_bind", "allow_port",
             "env_credential", "env_credential_map",
-            "allow_command", "block_command", "allow_launch_services",
+            "allow_command", "block_command", "allow_launch_services", "allow_gpu",
         ],
         help_heading = "OPTIONS"
     )]
@@ -1045,6 +1053,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             block_command: args.block_command,
             profile: args.profile,
             allow_launch_services: args.allow_launch_services,
+            allow_gpu: args.allow_gpu,
             config: args.config,
             verbose: args.verbose,
             dry_run: args.dry_run,

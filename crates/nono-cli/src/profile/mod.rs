@@ -981,6 +981,8 @@ pub struct Profile {
     /// When `None`, inherits from the base profile.
     #[serde(default)]
     pub allow_launch_services: Option<bool>,
+    #[serde(default)]
+    pub allow_gpu: Option<bool>,
     /// Deprecated: Parsed for backward compatibility but ignored.
     /// Supervised mode preserves TTY by default, making this unnecessary.
     #[serde(default)]
@@ -1022,6 +1024,8 @@ struct ProfileDeserialize {
     #[serde(default)]
     allow_launch_services: Option<bool>,
     #[serde(default)]
+    allow_gpu: Option<bool>,
+    #[serde(default)]
     interactive: bool,
     #[serde(default)]
     skipdirs: Vec<String>,
@@ -1042,6 +1046,7 @@ impl From<ProfileDeserialize> for Profile {
             rollback: raw.rollback,
             open_urls: raw.open_urls,
             allow_launch_services: raw.allow_launch_services,
+            allow_gpu: raw.allow_gpu,
             interactive: raw.interactive,
             skipdirs: raw.skipdirs,
         }
@@ -1473,6 +1478,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             None => base.open_urls,
         },
         allow_launch_services: child.allow_launch_services.or(base.allow_launch_services),
+        allow_gpu: child.allow_gpu.or(base.allow_gpu),
         interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
     }
@@ -2668,6 +2674,7 @@ mod tests {
                 allow_localhost: false,
             }),
             allow_launch_services: Some(false),
+            allow_gpu: None,
             interactive: false,
             skipdirs: vec!["vendor".to_string()],
         }
@@ -2736,6 +2743,7 @@ mod tests {
                 allow_localhost: true,
             }),
             allow_launch_services: Some(true),
+            allow_gpu: None,
             interactive: false,
             skipdirs: vec!["dist".to_string()],
         }
@@ -3344,6 +3352,21 @@ mod tests {
         child.allow_launch_services = Some(false);
         let merged = merge_profiles(base_profile(), child);
         assert_eq!(merged.allow_launch_services, Some(false));
+    }
+
+    #[test]
+    fn test_merge_profiles_allow_gpu_child_overrides_base() {
+        let mut base = base_profile();
+        base.allow_gpu = Some(true);
+        let merged = merge_profiles(base, child_profile());
+        assert_eq!(merged.allow_gpu, Some(true));
+
+        let mut child = child_profile();
+        child.allow_gpu = Some(false);
+        let mut base = base_profile();
+        base.allow_gpu = Some(true);
+        let merged = merge_profiles(base, child);
+        assert_eq!(merged.allow_gpu, Some(false));
     }
 
     #[test]

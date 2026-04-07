@@ -122,6 +122,8 @@ pub struct ProfileDef {
     #[serde(default)]
     pub allow_launch_services: Option<bool>,
     #[serde(default)]
+    pub allow_gpu: Option<bool>,
+    #[serde(default)]
     pub interactive: bool,
 }
 
@@ -152,6 +154,7 @@ impl ProfileDef {
             rollback: self.rollback.clone(),
             open_urls: self.open_urls.clone(),
             allow_launch_services: self.allow_launch_services,
+            allow_gpu: self.allow_gpu,
             interactive: self.interactive,
             skipdirs: Vec::new(),
         }
