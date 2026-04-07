@@ -440,7 +440,7 @@ pub fn run_pre_exec_scan(
         let result = verify_instruction_file(&file_path, policy);
 
         if !silent {
-            print_verification_line(&file_path, &file_path, &result, policy.enforcement);
+            print_verification_line(&file_path, scan_root, &result, policy.enforcement);
         }
 
         if result.outcome.is_verified() {
