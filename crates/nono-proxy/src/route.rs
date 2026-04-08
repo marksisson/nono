@@ -26,6 +26,11 @@ pub struct LoadedRoute {
     /// Upstream URL (e.g., "https://api.openai.com")
     pub upstream: String,
 
+    /// Pre-normalised `host:port` extracted from `upstream` at load time.
+    /// Used for O(1) lookups in `is_route_upstream()` without per-request
+    /// URL parsing. `None` if the upstream URL cannot be parsed.
+    pub upstream_host_port: Option<String>,
+
     /// Pre-compiled L7 endpoint rules for method+path filtering.
     /// When non-empty, only matching requests are allowed (default-deny).
     /// When empty, all method+path combinations are permitted.
@@ -41,6 +46,7 @@ impl std::fmt::Debug for LoadedRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadedRoute")
             .field("upstream", &self.upstream)
+            .field("upstream_host_port", &self.upstream_host_port)
             .field("endpoint_rules", &self.endpoint_rules)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
             .finish()
@@ -88,10 +94,13 @@ impl RouteStore {
                 None => None,
             };
 
+            let upstream_host_port = extract_host_port(&route.upstream);
+
             loaded.insert(
                 normalized_prefix,
                 LoadedRoute {
                     upstream: route.upstream.clone(),
+                    upstream_host_port,
                     endpoint_rules,
                     tls_connector,
                 },
@@ -128,26 +137,26 @@ impl RouteStore {
     }
 
     /// Check whether `host_port` (e.g. `"api.openai.com:443"`) matches
-    /// any route's upstream URL. Used to determine whether a CONNECT tunnel
-    /// should be MITM'd for L7 filtering or passed through transparently.
+    /// any route's upstream URL. Uses pre-normalised `host:port` strings
+    /// computed at load time to avoid per-request URL parsing.
     #[must_use]
     pub fn is_route_upstream(&self, host_port: &str) -> bool {
         let normalised = host_port.to_lowercase();
         self.routes.values().any(|route| {
-            extract_host_port(&route.upstream)
-                .map(|hp| hp == normalised)
-                .unwrap_or(false)
+            route
+                .upstream_host_port
+                .as_ref()
+                .is_some_and(|hp| *hp == normalised)
         })
     }
 
     /// Return the set of normalised `host:port` strings for all route
-    /// upstreams. Used to compute smart `NO_PROXY` — hosts in this set must
-    /// NOT be bypassed because they need reverse proxy routing.
+    /// upstreams. Uses pre-normalised values computed at load time.
     #[must_use]
     pub fn route_upstream_hosts(&self) -> std::collections::HashSet<String> {
         self.routes
             .values()
-            .filter_map(|route| extract_host_port(&route.upstream))
+            .filter_map(|route| route.upstream_host_port.clone())
             .collect()
     }
 }
@@ -410,6 +419,7 @@ mod tests {
     fn test_loaded_route_debug() {
         let route = LoadedRoute {
             upstream: "https://api.openai.com".to_string(),
+            upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
             tls_connector: None,
         };
