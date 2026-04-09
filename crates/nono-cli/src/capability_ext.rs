@@ -163,6 +163,62 @@ fn resolve_missing_leaf_path(path: &Path) -> Result<PathBuf> {
     Err(NonoError::PathNotFound(path.to_path_buf()))
 }
 
+/// Add a platform rule to allow atomic-write temp files for a writable file.
+///
+/// Many tools (e.g. Claude Code) write atomically by creating a temp file
+/// (`file.tmp.PID.TIMESTAMP`) then renaming it over the target. This function
+/// adds a Seatbelt regex rule to permit creating/writing those temp files
+/// alongside the allowed file.
+#[cfg(target_os = "macos")]
+fn add_atomic_write_rule(caps: &mut CapabilitySet, cap: &FsCapability) -> Result<()> {
+    if !matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite) {
+        return Ok(());
+    }
+
+    fn add_rule_for_path(caps: &mut CapabilitySet, path: &Path) -> Result<()> {
+        let path_str = path.to_str().ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "non-UTF-8 path for atomic write rule: {}",
+                path.display()
+            ))
+        })?;
+        let escaped = regex_escape_path(path_str);
+        let rule = format!(
+            "(allow file-write* (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9]+$\"))",
+            escaped
+        );
+        caps.add_platform_rule(&rule)
+    }
+
+    add_rule_for_path(caps, &cap.resolved)?;
+    if cap.original != cap.resolved {
+        add_rule_for_path(caps, &cap.original)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn add_atomic_write_rule(_caps: &mut CapabilitySet, _cap: &FsCapability) -> Result<()> {
+    Ok(())
+}
+
+/// Escape a filesystem path for use in a Seatbelt regex.
+/// Only metacharacters that could appear in typical paths need escaping.
+#[cfg(target_os = "macos")]
+fn regex_escape_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        match c {
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn apply_profile_dir_allows(
     path_templates: &[String],
     access: AccessMode,
@@ -394,6 +450,9 @@ impl CapabilitySetExt for CapabilitySet {
             if let Some(mut cap) =
                 try_new_profile_exact_path(&path, AccessMode::ReadWrite, &label, &protected_roots)?
             {
+                // Also allow atomic-write temp files (e.g. .claude.json.tmp.PID.TS).
+                // Many tools write to a temp file then rename for crash safety.
+                add_atomic_write_rule(&mut caps, &cap)?;
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
@@ -418,6 +477,7 @@ impl CapabilitySetExt for CapabilitySet {
             if let Some(mut cap) =
                 try_new_profile_exact_path(&path, AccessMode::Write, &label, &protected_roots)?
             {
+                add_atomic_write_rule(&mut caps, &cap)?;
                 cap.source = CapabilitySource::Profile;
                 caps.add_fs(cap);
             }
@@ -1900,6 +1960,15 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_regex_escape_path_dots() {
+        assert_eq!(
+            regex_escape_path("/Users/me/.claude.json"),
+            "/Users/me/\\.claude\\.json"
+        );
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_from_args_allow_proxy_ports_added_to_tcp_connect() {
@@ -1923,6 +1992,57 @@ mod tests {
             ports.contains(&4222),
             "tcp_connect_ports should contain 4222 for nats.example.com:4222, got: {:?}",
             ports
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_regex_escape_path_no_metacharacters() {
+        assert_eq!(regex_escape_path("/usr/local/bin"), "/usr/local/bin");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_regex_escape_path_special_chars() {
+        assert_eq!(
+            regex_escape_path("/path/with+parens(1)[2]"),
+            "/path/with\\+parens\\(1\\)\\[2\\]"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_atomic_write_rule_adds_regex_for_writable_file() {
+        let tmp = tempdir().expect("tempdir");
+        let file_path = tmp.path().join("test.json");
+        std::fs::write(&file_path, "{}").expect("write");
+        let cap = FsCapability::new_file(&file_path, AccessMode::ReadWrite).expect("cap");
+        let mut caps = CapabilitySet::new();
+        add_atomic_write_rule(&mut caps, &cap).expect("add rule");
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            rules.contains("file-write*"),
+            "should contain file-write rule"
+        );
+        assert!(
+            rules.contains(r"\.tmp\.[0-9]+\.[0-9]+"),
+            "should contain temp file pattern, got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_atomic_write_rule_skips_readonly_file() {
+        let tmp = tempdir().expect("tempdir");
+        let file_path = tmp.path().join("readonly.json");
+        std::fs::write(&file_path, "{}").expect("write");
+        let cap = FsCapability::new_file(&file_path, AccessMode::Read).expect("cap");
+        let mut caps = CapabilitySet::new();
+        add_atomic_write_rule(&mut caps, &cap).expect("add rule");
+        assert!(
+            caps.platform_rules().is_empty(),
+            "read-only file should not get atomic write rule"
         );
     }
 }
