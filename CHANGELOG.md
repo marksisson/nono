@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.32.0] - 2026-04-10
+
+### Features
+
+- Add upstream mTLS client certificate support
+
 ## [0.31.0] - 2026-04-10
 
 ### Bug Fixes
