@@ -2006,20 +2006,22 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let original_tmpdir = std::env::var("TMPDIR").unwrap_or("/tmp".to_string());
 
         let _env = crate::test_env::EnvVarGuard::set_all(&[
             ("HOME", home.to_str().expect("home path")),
             ("TMPDIR", temp_root.to_str().expect("tmpdir path")),
         ]);
 
-        let skip_tmp = should_skip_group_allow_path("system_write_linux", Path::new("/tmp"))
-            .expect("check /tmp skip");
+        let skip_tmp =
+            should_skip_group_allow_path("system_write_linux", Path::new(&original_tmpdir))
+                .expect("check original TMPDIR skip");
         let skip_tmpdir = should_skip_group_allow_path("system_write_linux", &temp_root)
-            .expect("check TMPDIR skip");
+            .expect("check new TMPDIR skip");
 
         assert!(
             skip_tmp,
-            "/tmp should be skipped when HOME is nested under it"
+            "original TMPDIR should be skipped when HOME is nested under it"
         );
         assert!(
             skip_tmpdir,
