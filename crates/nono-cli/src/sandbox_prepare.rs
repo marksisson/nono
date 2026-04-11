@@ -310,7 +310,7 @@ pub(crate) fn maybe_enable_macos_gpu(
     Ok(true)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), test))]
 pub(crate) fn maybe_enable_macos_gpu(
     _caps: &mut CapabilitySet,
     cli_requested: bool,
