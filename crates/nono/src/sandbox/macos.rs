@@ -867,6 +867,7 @@ mod tests {
         assert!(profile.contains("(allow iokit-open"));
         assert!(profile.contains("AGXDeviceUserClient"));
         assert!(!profile.contains("IOGPU"));
+        assert!(!profile.contains("AGXSharedUserClient"));
         assert!(!profile.contains("IOSurfaceRootUserClient"));
         assert!(profile.contains("(allow iokit-get-properties)"));
     }
