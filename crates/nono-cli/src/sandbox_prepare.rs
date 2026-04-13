@@ -647,6 +647,29 @@ fn missing_cwd_prompt_must_fail(
     silent || (detached_launch && detached_prompt_response.is_none())
 }
 
+/// Returns true for `/dev/` filenames that correspond to NVIDIA compute device
+/// nodes that should be granted by `--allow-gpu`.
+///
+/// Matches:
+///   - `nvidiactl` — control device, required for all CUDA operations
+///   - `nvidia-uvm` — Unified Virtual Memory, required for CUDA managed memory
+///   - `nvidia-uvm-tools` — opened by driver 570+ during UVM init
+///   - `nvidia<N>` where `N` is one or more ASCII digits — per-GPU device nodes
+///
+/// Deliberately rejects `nvidia-modeset` (display, not compute) and any other
+/// non-enumerated `nvidia-*` suffix. Keep in sync with the comment block in
+/// `maybe_enable_gpu`.
+#[cfg(target_os = "linux")]
+fn is_nvidia_compute_device(name: &str) -> bool {
+    if name == "nvidiactl" || name == "nvidia-uvm" || name == "nvidia-uvm-tools" {
+        return true;
+    }
+    if let Some(suffix) = name.strip_prefix("nvidia") {
+        return !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn maybe_enable_gpu(
     caps: &mut CapabilitySet,
@@ -704,16 +727,7 @@ pub(crate) fn maybe_enable_gpu(
     if let Ok(dev_entries) = std::fs::read_dir("/dev") {
         let nvidia_devices: Vec<_> = dev_entries
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_str().is_some_and(|n| {
-                    n == "nvidiactl"
-                        || n == "nvidia-uvm"
-                        || n == "nvidia-uvm-tools"
-                        || (n.starts_with("nvidia")
-                            && n[6..].bytes().all(|b| b.is_ascii_digit())
-                            && n.len() > 6)
-                })
-            })
+            .filter(|e| e.file_name().to_str().is_some_and(is_nvidia_compute_device))
             .map(|e| e.path())
             .collect();
         gpu_device_count = gpu_device_count.saturating_add(nvidia_devices.len());
@@ -765,7 +779,8 @@ pub(crate) fn maybe_enable_gpu(
     if gpu_device_count == 0 {
         return Err(NonoError::SandboxInit(
             "--allow-gpu: no GPU devices found (checked /dev/dri/renderD*, \
-             /dev/nvidia*, /dev/nvidia-uvm-tools, /dev/kfd, /dev/dxg)"
+             /dev/nvidia* (incl. nvidiactl, nvidia-uvm, nvidia-uvm-tools), \
+             /dev/nvidia-caps/*, /dev/kfd, /dev/dxg)"
                 .to_string(),
         ));
     }
@@ -1137,6 +1152,44 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::fs;
     use tempfile::tempdir;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvidia_compute_device_predicate_accepts_known_names() {
+        for name in [
+            "nvidiactl",
+            "nvidia-uvm",
+            "nvidia-uvm-tools",
+            "nvidia0",
+            "nvidia7",
+            "nvidia15",
+        ] {
+            assert!(
+                is_nvidia_compute_device(name),
+                "expected {name} to be granted"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvidia_compute_device_predicate_rejects_non_compute_and_unknown() {
+        for name in [
+            "nvidia",           // bare prefix, no digits
+            "nvidia-modeset",   // display, not compute
+            "nvidia-nvswitch0", // not yet supported
+            "nvidia-uvm-other", // unknown -tools-style suffix
+            "nvidiaX",          // non-digit suffix
+            "nvidia0a",         // mixed suffix
+            "not-nvidia",       // wrong prefix
+            "",                 // empty
+        ] {
+            assert!(
+                !is_nvidia_compute_device(name),
+                "expected {name} to be rejected"
+            );
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
