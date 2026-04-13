@@ -137,6 +137,14 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub query_param_name: Option<String>,
 
+    /// Optional overrides for proxy-side phantom token handling.
+    ///
+    /// When set, these values control how the local proxy validates incoming
+    /// phantom tokens from the sandboxed process. Outbound upstream injection
+    /// still uses the top-level fields.
+    #[serde(default)]
+    pub proxy: Option<nono_proxy::config::ProxyInjectConfig>,
+
     /// Explicit environment variable name for the phantom token (e.g., "OPENAI_API_KEY").
     ///
     /// When set, the proxy uses this as the SDK API key env var instead of
@@ -325,6 +333,126 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         InjectMode::BasicAuth => {
             // No additional required fields for basic_auth mode
             // Credential value is expected to be "username:password" format
+        }
+    }
+
+    validate_proxy_override(name, cred)?;
+
+    Ok(())
+}
+
+fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+    let Some(proxy) = cred.proxy.as_ref() else {
+        return Ok(());
+    };
+
+    let mode = proxy.inject_mode.as_ref().unwrap_or(&cred.inject_mode);
+
+    match mode {
+        InjectMode::Header | InjectMode::BasicAuth => {
+            let header = proxy
+                .inject_header
+                .as_deref()
+                .unwrap_or(cred.inject_header.as_str());
+            if header.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.inject_header for custom credential '{}' cannot be empty",
+                    name
+                )));
+            }
+            if !header.chars().all(is_http_token_char) {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.inject_header '{}' for custom credential '{}' contains invalid characters; \
+                     header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
+                    header, name
+                )));
+            }
+
+            if *mode == InjectMode::Header {
+                let format = proxy
+                    .credential_format
+                    .as_deref()
+                    .unwrap_or(cred.credential_format.as_str());
+                if format.contains('\r') || format.contains('\n') {
+                    return Err(NonoError::ProfileParse(format!(
+                        "proxy.credential_format for custom credential '{}' contains invalid CRLF characters; \
+                         this could enable header injection attacks",
+                        name
+                    )));
+                }
+            }
+        }
+        InjectMode::UrlPath => {
+            let pattern = proxy
+                .path_pattern
+                .as_deref()
+                .or(cred.path_pattern.as_deref())
+                .ok_or_else(|| {
+                    NonoError::ProfileParse(format!(
+                        "proxy.path_pattern is required for custom credential '{}' when effective inject_mode is 'url_path'",
+                        name
+                    ))
+                })?;
+            if !pattern.contains("{}") {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.path_pattern '{}' for custom credential '{}' must contain {{}} placeholder",
+                    pattern, name
+                )));
+            }
+            if pattern.contains('\r') || pattern.contains('\n') {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.path_pattern for custom credential '{}' contains invalid CRLF characters",
+                    name
+                )));
+            }
+
+            if let Some(replacement) = proxy
+                .path_replacement
+                .as_deref()
+                .or(cred.path_replacement.as_deref())
+            {
+                if !replacement.contains("{}") {
+                    return Err(NonoError::ProfileParse(format!(
+                        "proxy.path_replacement '{}' for custom credential '{}' must contain {{}} placeholder",
+                        replacement, name
+                    )));
+                }
+                if replacement.contains('\r') || replacement.contains('\n') {
+                    return Err(NonoError::ProfileParse(format!(
+                        "proxy.path_replacement for custom credential '{}' contains invalid CRLF characters",
+                        name
+                    )));
+                }
+            }
+        }
+        InjectMode::QueryParam => {
+            let param_name = proxy
+                .query_param_name
+                .as_deref()
+                .or(cred.query_param_name.as_deref())
+                .ok_or_else(|| {
+                    NonoError::ProfileParse(format!(
+                        "proxy.query_param_name is required for custom credential '{}' when effective inject_mode is 'query_param'",
+                        name
+                    ))
+                })?;
+
+            if param_name.is_empty() {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.query_param_name for custom credential '{}' cannot be empty",
+                    name
+                )));
+            }
+            if !param_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(NonoError::ProfileParse(format!(
+                    "proxy.query_param_name '{}' for custom credential '{}' must contain only \
+                     alphanumeric characters, underscores, and hyphens",
+                    param_name, name
+                )));
+            }
         }
     }
 
@@ -2184,6 +2312,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2346,6 +2475,7 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2366,6 +2496,7 @@ mod tests {
             path_pattern: None, // Missing required field
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2388,6 +2519,7 @@ mod tests {
             path_pattern: Some("/bot/token/".to_string()), // No {} placeholder
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2410,6 +2542,7 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot{}/".to_string()),
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2430,6 +2563,7 @@ mod tests {
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot/fixed/".to_string()), // No {} placeholder
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2452,6 +2586,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("key".to_string()),
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2472,6 +2607,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None, // Missing required field
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2494,6 +2630,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("".to_string()), // Empty
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2516,6 +2653,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
@@ -2525,6 +2663,57 @@ mod tests {
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
         assert!(validate_custom_credential("example", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_proxy_override_query_param_requires_name() {
+        let mut cred = header_cred_builder();
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: Some(InjectMode::QueryParam),
+            inject_header: None,
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
+
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("proxy query_param_name should be required");
+        assert!(err
+            .to_string()
+            .contains("proxy.query_param_name is required"));
+    }
+
+    #[test]
+    fn test_validate_proxy_override_query_param_with_fallback_name() {
+        let mut cred = header_cred_builder();
+        cred.query_param_name = Some("api_key".to_string());
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: Some(InjectMode::QueryParam),
+            inject_header: None,
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
+
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_proxy_override_url_path_with_fallback_pattern() {
+        let mut cred = header_cred_builder();
+        cred.path_pattern = Some("/bot/{}/".to_string());
+        cred.proxy = Some(nono_proxy::config::ProxyInjectConfig {
+            inject_mode: Some(InjectMode::UrlPath),
+            inject_header: None,
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        });
+
+        assert!(validate_custom_credential("test", &cred).is_ok());
     }
 
     // ============================================================================
@@ -2843,6 +3032,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
@@ -2863,6 +3053,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
@@ -3001,6 +3192,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
@@ -3021,6 +3213,7 @@ mod tests {
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
+                proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
@@ -4228,6 +4421,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             tls_ca: None,
@@ -4251,6 +4445,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             endpoint_rules: vec![],
             env_var: None,
             tls_ca: None,
@@ -4277,6 +4472,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             tls_ca: None,
@@ -4303,6 +4499,7 @@ mod tests {
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
+            proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
             tls_ca: None,

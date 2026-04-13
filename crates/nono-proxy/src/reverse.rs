@@ -120,12 +120,12 @@ pub async fn handle_reverse_proxy(
         // Credential route: validate phantom token from the service's auth
         // header (mode-dependent: header, url_path, query_param, basic_auth).
         if let Err(e) = validate_phantom_token_for_mode(
-            &cred.inject_mode,
+            &cred.proxy_inject_mode,
             remaining_header,
             &upstream_path,
-            &cred.header_name,
-            cred.path_pattern.as_deref(),
-            cred.query_param_name.as_deref(),
+            &cred.proxy_header_name,
+            cred.proxy_path_pattern.as_deref(),
+            cred.proxy_query_param_name.as_deref(),
             ctx.session_token,
         ) {
             audit::log_denied(
@@ -203,7 +203,7 @@ pub async fn handle_reverse_proxy(
     // (it contains the phantom token, not a real credential).
     // When no credential is present, pass all other headers through —
     // the caller may have a real Authorization header for the upstream.
-    let strip_header = cred.map(|c| c.header_name.as_str()).unwrap_or("");
+    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
     let filtered_headers = filter_headers(remaining_header, strip_header);
     let content_length = extract_content_length(remaining_header);
 
@@ -1192,5 +1192,45 @@ mod tests {
         let path = "/api/data";
         let result = transform_query_param(path, "api_key", &credential).unwrap();
         assert_eq!(result, "/api/data?api_key=key%20with%20spaces");
+    }
+
+    #[test]
+    fn test_validate_phantom_token_uses_proxy_mode_over_upstream_mode() {
+        let token = Zeroizing::new("session123".to_string());
+        let header = b"Authorization: Bearer session123\r\n\r\n";
+        let path = "/api/data?api_key=wrong";
+
+        // Simulate split config where proxy-side mode is header while upstream
+        // mode might be query_param.
+        let result = validate_phantom_token_for_mode(
+            &InjectMode::Header,
+            header,
+            path,
+            "Authorization",
+            None,
+            Some("api_key"),
+            &token,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_transform_path_uses_upstream_mode_independently() {
+        let credential = Zeroizing::new("real_key".to_string());
+        let path = "/api/data?api_key=phantom";
+
+        // Simulate split config where upstream mode is query_param.
+        let transformed = transform_path_for_mode(
+            &InjectMode::QueryParam,
+            path,
+            None,
+            None,
+            Some("api_key"),
+            &credential,
+        )
+        .expect("query-param transform should succeed");
+
+        assert_eq!(transformed, "/api/data?api_key=real_key");
     }
 }

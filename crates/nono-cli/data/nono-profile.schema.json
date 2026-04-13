@@ -419,6 +419,13 @@
           ],
           "description": "Name of the query parameter to add or replace with the credential. Required when inject_mode is \"query_param\"."
         },
+        "proxy": {
+          "oneOf": [
+            { "$ref": "#/$defs/ProxyInjectConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional proxy-side overrides for phantom token parsing. When omitted, proxy behavior uses top-level custom credential fields."
+        },
         "env_var": {
           "oneOf": [
             { "type": "string" },
@@ -478,6 +485,55 @@
       "enum": ["header", "url_path", "query_param", "basic_auth"],
       "description": "Credential injection mode for the reverse proxy.",
       "default": "header"
+    },
+    "ProxyInjectConfig": {
+      "type": "object",
+      "description": "Optional proxy-side overrides for phantom token parsing. These settings only affect incoming client request validation, not outbound upstream credential injection.",
+      "additionalProperties": false,
+      "properties": {
+        "inject_mode": {
+          "oneOf": [
+            { "$ref": "#/$defs/InjectMode" },
+            { "type": "null" }
+          ],
+          "description": "Override inject mode for proxy-side phantom token parsing. Falls back to parent inject_mode when omitted."
+        },
+        "inject_header": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override header name for proxy-side header/basic_auth modes. Falls back to parent inject_header when omitted."
+        },
+        "credential_format": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override credential format for proxy-side header mode. Falls back to parent credential_format when omitted."
+        },
+        "path_pattern": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override path pattern for proxy-side url_path mode. Falls back to parent path_pattern when omitted."
+        },
+        "path_replacement": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override path replacement for proxy-side url_path mode. Falls back to parent path_replacement when omitted."
+        },
+        "query_param_name": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Override query parameter name for proxy-side query_param mode. Falls back to parent query_param_name when omitted."
+        }
+      }
     },
     "SecretsConfig": {
       "type": "object",

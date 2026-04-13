@@ -128,7 +128,11 @@ Define a custom reverse proxy credential route for services not in `network-poli
   "credential_key": "example_api_key",
   "inject_mode": "header",
   "inject_header": "Authorization",
-  "credential_format": "Bearer {}"
+  "credential_format": "Bearer {}",
+  "proxy": {
+    "inject_mode": "query_param",
+    "query_param_name": "api_key"
+  }
 }
 ```
 
@@ -142,11 +146,14 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | `path_pattern`      | string          | url_path    | Pattern to match in URL path. Use `{}` for placeholder. |
 | `path_replacement`  | string          | url_path    | Replacement pattern. Defaults to `path_pattern`. |
 | `query_param_name`  | string          | query_param | Query parameter name for credential injection. |
+| `proxy`             | object          | no          | Optional proxy-side overrides for phantom token parsing. Omitted fields inherit from top-level values. |
 | `env_var`           | string          | URI keys    | Environment variable name for SDK API key. Required when `credential_key` is a URI. |
 | `endpoint_rules`    | array           | no          | L7 allow-list of `{"method": "GET", "path": "/**"}` rules. When non-empty, only matching requests are forwarded (default-deny). |
 | `tls_ca`            | string (path)   | no          | Path to a PEM-encoded CA certificate. Use for upstreams with self-signed or private CA certs (e.g. a Kubernetes API server). |
 | `tls_client_cert`   | string (path)   | no          | Path to a PEM-encoded client certificate for mutual TLS (mTLS). Must be set together with `tls_client_key`. |
 | `tls_client_key`    | string (path)   | no          | Path to the PEM-encoded private key matching `tls_client_cert`. |
+
+`proxy` overrides apply only to how the local proxy validates incoming phantom tokens from the sandboxed process. Outbound upstream credential injection continues to use top-level fields.
 
 ### env_credentials (alias: secrets)
 
