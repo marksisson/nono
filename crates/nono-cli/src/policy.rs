@@ -274,6 +274,20 @@ pub(crate) fn escape_seatbelt_path(path: &str) -> Result<String> {
     Ok(result)
 }
 
+fn escape_seatbelt_regex_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 8);
+    for c in path.chars() {
+        match c {
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 // ============================================================================
 // Group resolution
 // ============================================================================
@@ -681,7 +695,9 @@ pub(crate) fn add_deny_access_rules(
 /// Add a narrow macOS exception for explicit keychain DB file grants.
 ///
 /// This keeps broad keychain deny groups active while allowing only the exact
-/// file capability intended by a profile or CLI flag.
+/// file capability intended by a profile or CLI flag, plus the backing
+/// SQLite/WAL/SHM files the Security framework actually touches under
+/// `~/Library/Keychains/<UUID>/...`.
 pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
     if !cfg!(target_os = "macos") {
         return;
@@ -713,39 +729,113 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
         false
     };
 
-    let allow_rules: Vec<String> = caps
-        .fs_capabilities()
-        .iter()
-        .filter(|cap| cap.is_file)
-        .filter(|cap| matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite))
-        .map(|cap| cap.resolved.clone())
-        .filter(|path| is_keychain_db(path))
-        .filter_map(|path| {
-            let path_str = match path_to_utf8(&path) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        "Skipping keychain DB exception for {}: {}",
-                        path.display(),
-                        e
-                    );
-                    return None;
+    let merge_access = |existing: &mut AccessMode, next: AccessMode| {
+        *existing = match (*existing, next) {
+            (AccessMode::ReadWrite, _) | (_, AccessMode::ReadWrite) => AccessMode::ReadWrite,
+            (AccessMode::Read, AccessMode::Write) | (AccessMode::Write, AccessMode::Read) => {
+                AccessMode::ReadWrite
+            }
+            (mode, _) => mode,
+        };
+    };
+
+    let mut explicit_paths: HashMap<PathBuf, AccessMode> = HashMap::new();
+    let mut keychain_roots: HashMap<PathBuf, AccessMode> = HashMap::new();
+
+    for cap in caps.fs_capabilities().iter().filter(|cap| cap.is_file) {
+        if !is_keychain_db(&cap.resolved) {
+            continue;
+        }
+
+        explicit_paths
+            .entry(cap.resolved.clone())
+            .and_modify(|mode| merge_access(mode, cap.access))
+            .or_insert(cap.access);
+
+        if let Some(root) = cap.resolved.parent() {
+            keychain_roots
+                .entry(root.to_path_buf())
+                .and_modify(|mode| merge_access(mode, cap.access))
+                .or_insert(cap.access);
+        }
+    }
+
+    let mut allow_rules = Vec::new();
+
+    for (path, access) in explicit_paths {
+        let path_str = match path_to_utf8(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain DB exception for {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let escaped = match escape_seatbelt_path(path_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain DB exception for {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let filter = format!("literal \"{}\"", escaped);
+        match access {
+            AccessMode::Read => {
+                allow_rules.push(format!("(allow file-read* ({}))", filter));
+            }
+            AccessMode::Write => {
+                allow_rules.push(format!("(allow file-write* ({}))", filter));
+            }
+            AccessMode::ReadWrite => {
+                allow_rules.push(format!("(allow file-read* ({}))", filter));
+                allow_rules.push(format!("(allow file-write* ({}))", filter));
+            }
+        }
+    }
+
+    for (root, access) in keychain_roots {
+        let root_str = match path_to_utf8(&root) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Skipping keychain runtime exception for {}: {}",
+                    root.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        let escaped_root = escape_seatbelt_regex_path(root_str);
+        let filters = [
+            format!(r#"regex #"^{}/\.fl[0-9A-Fa-f]+$""#, escaped_root),
+            format!(
+                r#"regex #"^{}/[^/]+/(?:[^/]+\.db(?:-(?:wal|shm))?|user\.kb)$""#,
+                escaped_root
+            ),
+        ];
+
+        for filter in filters {
+            match access {
+                AccessMode::Read => {
+                    allow_rules.push(format!("(allow file-read* ({}))", filter));
                 }
-            };
-            let escaped = match escape_seatbelt_path(path_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        "Skipping keychain DB exception for {}: {}",
-                        path.display(),
-                        e
-                    );
-                    return None;
+                AccessMode::Write => {
+                    allow_rules.push(format!("(allow file-write* ({}))", filter));
                 }
-            };
-            Some(format!("(allow file-read-data (literal \"{}\"))", escaped))
-        })
-        .collect();
+                AccessMode::ReadWrite => {
+                    allow_rules.push(format!("(allow file-read* ({}))", filter));
+                    allow_rules.push(format!("(allow file-write* ({}))", filter));
+                }
+            }
+        }
+    }
 
     for rule in allow_rules {
         if let Err(e) = caps.add_platform_rule(rule) {
@@ -2497,10 +2587,18 @@ mod tests {
         let rules = caps.platform_rules().join("\n");
         assert!(
             rules.contains(&format!(
-                "(allow file-read-data (literal \"{}\"))",
+                "(allow file-read* (literal \"{}\"))",
                 escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
             )),
             "expected login keychain DB exception rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB write rule, got: {}",
             rules
         );
     }
@@ -2524,11 +2622,85 @@ mod tests {
         let rules = caps.platform_rules().join("\n");
         assert!(
             rules.contains(&format!(
-                "(allow file-read-data (literal \"{}\"))",
+                "(allow file-read* (literal \"{}\"))",
                 escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
                     .expect("escaped path")
             )),
             "expected metadata keychain DB exception rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB write rule, got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_macos_keychain_db_exception_adds_runtime_keychain_rules() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let keychains = home.join("Library/Keychains");
+        std::fs::create_dir_all(&keychains).expect("mkdir keychains");
+        std::fs::write(keychains.join("login.keychain-db"), "").expect("write login db");
+        std::fs::write(keychains.join("metadata.keychain-db"), "").expect("write metadata db");
+
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            "HOME",
+            home.to_str().expect("home path utf8"),
+        )]);
+
+        let login_db = keychains.join("login.keychain-db");
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: login_db.clone(),
+            resolved: login_db,
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        apply_macos_keychain_db_exception(&mut caps);
+
+        let escaped_root =
+            escape_seatbelt_regex_path(keychains.to_str().expect("keychains path utf8"));
+        let rules = caps.platform_rules().join("\n");
+
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
+                escaped_root
+            )),
+            "expected root .fl keychain rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (regex #\"^{}/\\.fl[0-9A-Fa-f]+$\"))",
+                escaped_root
+            )),
+            "expected writable root .fl keychain rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
+                escaped_root
+            )),
+            "expected runtime DB read rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write* (regex #\"^{}/[^/]+/(?:[^/]+\\.db(?:-(?:wal|shm))?|user\\.kb)$\"))",
+                escaped_root
+            )),
+            "expected runtime DB write rule, got: {}",
             rules
         );
     }

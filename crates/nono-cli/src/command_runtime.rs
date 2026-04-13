@@ -9,14 +9,14 @@ use crate::output;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
-    validate_external_proxy_bypass,
+    should_auto_enable_claude_launch_services, validate_external_proxy_bypass,
 };
 use crate::theme;
 use nono::{NonoError, Result};
 use std::ffi::OsString;
+use tracing::warn;
 
-pub(crate) fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
-    let args = run_args.sandbox.clone();
+pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
     let command = run_args.command.clone();
 
     if command.is_empty() {
@@ -26,6 +26,13 @@ pub(crate) fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     let mut command_iter = command.into_iter();
     let program = OsString::from(command_iter.next().ok_or(NonoError::NoCommand)?);
     let cmd_args: Vec<OsString> = command_iter.map(OsString::from).collect();
+    if should_auto_enable_claude_launch_services(&run_args.sandbox, &program, &cmd_args) {
+        warn!(
+            "Auto-enabling --allow-launch-services for Claude Code because no refresh-capable local auth was detected"
+        );
+        run_args.sandbox.allow_launch_services = true;
+    }
+    let args = run_args.sandbox.clone();
 
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;

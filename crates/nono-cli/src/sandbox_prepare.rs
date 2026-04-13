@@ -11,10 +11,16 @@ use crate::{output, policy, protected_paths, sandbox_state};
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
+#[cfg(target_os = "macos")]
+use serde::Deserialize;
+#[cfg(target_os = "macos")]
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use tracing::{info, warn};
 
 fn collect_missing_cli_requested_paths(args: &SandboxArgs) -> Vec<String> {
@@ -52,6 +58,299 @@ fn collect_missing_cli_requested_paths(args: &SandboxArgs) -> Vec<String> {
     }
 
     missing
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+struct ClaudeStoredAuth {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: Option<ClaudeOauthState>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+struct ClaudeOauthState {
+    #[serde(rename = "accessToken")]
+    access_token: Option<String>,
+    #[serde(rename = "refreshToken")]
+    refresh_token: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+struct ClaudeGlobalConfig {
+    #[serde(rename = "primaryApiKey")]
+    primary_api_key: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn claude_oauth_suffix() -> &'static str {
+    if std::env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").is_some() {
+        return "-custom-oauth";
+    }
+    if std::env::var("USER_TYPE").ok().as_deref() == Some("ant") {
+        if env_truthy("USE_LOCAL_OAUTH") {
+            return "-local-oauth";
+        }
+        if env_truthy("USE_STAGING_OAUTH") {
+            return "-staging-oauth";
+        }
+    }
+    ""
+}
+
+#[cfg(target_os = "macos")]
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn env_non_empty(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn claude_config_dir() -> std::result::Result<(PathBuf, bool), String> {
+    if let Some(config_dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Ok((PathBuf::from(config_dir), true));
+    }
+    let home = config::validated_home().map_err(|err| err.to_string())?;
+    Ok((PathBuf::from(home).join(".claude"), false))
+}
+
+#[cfg(target_os = "macos")]
+fn claude_global_config_path(
+    config_dir: &Path,
+    config_dir_explicit: bool,
+) -> std::result::Result<PathBuf, String> {
+    let legacy = config_dir.join(".config.json");
+    if legacy.is_file() {
+        return Ok(legacy);
+    }
+    let suffix = claude_oauth_suffix();
+    if config_dir_explicit {
+        return Ok(config_dir.join(format!(".claude{suffix}.json")));
+    }
+    let home = config::validated_home().map_err(|err| err.to_string())?;
+    Ok(PathBuf::from(home).join(format!(".claude{suffix}.json")))
+}
+
+#[cfg(target_os = "macos")]
+fn claude_keychain_service_name(
+    config_dir: &Path,
+    config_dir_explicit: bool,
+    service_suffix: &str,
+) -> String {
+    let dir_hash = if config_dir_explicit {
+        let digest = Sha256::digest(config_dir.to_string_lossy().as_bytes());
+        let prefix = digest[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("-{prefix}")
+    } else {
+        String::new()
+    };
+    format!(
+        "Claude Code{}{}{}",
+        claude_oauth_suffix(),
+        service_suffix,
+        dir_hash
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn claude_keychain_account_name() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn read_keychain_item(account: &str, service_name: &str) -> Option<String> {
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-a",
+            account,
+            "-w",
+            "-s",
+            service_name,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    Some(stdout.trim_end_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_claude_oauth_state_json(
+    raw: &str,
+    source_label: &str,
+) -> std::result::Result<Option<ClaudeOauthState>, String> {
+    serde_json::from_str::<ClaudeStoredAuth>(raw)
+        .map(|parsed| parsed.claude_ai_oauth)
+        .map_err(|err| format!("failed to parse {source_label}: {err}"))
+}
+
+#[cfg(target_os = "macos")]
+fn load_claude_oauth_state_from_raw_sources(
+    keychain_raw: Option<&str>,
+    file_raw: Option<(&str, &str)>,
+) -> std::result::Result<Option<ClaudeOauthState>, String> {
+    if let Some(raw) = keychain_raw {
+        if let Some(oauth) = parse_claude_oauth_state_json(raw, "Claude OAuth keychain JSON")? {
+            return Ok(Some(oauth));
+        }
+    }
+
+    if let Some((raw, source_label)) = file_raw {
+        return parse_claude_oauth_state_json(raw, source_label);
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn load_claude_oauth_state() -> std::result::Result<Option<ClaudeOauthState>, String> {
+    let (config_dir, config_dir_explicit) = claude_config_dir()?;
+    let account = claude_keychain_account_name();
+    let oauth_service =
+        claude_keychain_service_name(&config_dir, config_dir_explicit, "-credentials");
+
+    let keychain_raw = read_keychain_item(&account, &oauth_service);
+    let credentials_path = config_dir.join(".credentials.json");
+    match std::fs::read_to_string(&credentials_path) {
+        Ok(raw) => load_claude_oauth_state_from_raw_sources(
+            keychain_raw.as_deref(),
+            Some((&raw, &credentials_path.display().to_string())),
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            load_claude_oauth_state_from_raw_sources(keychain_raw.as_deref(), None)
+        }
+        Err(err) => Err(format!(
+            "failed to read {}: {err}",
+            credentials_path.display()
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn claude_has_saved_api_key_auth() -> std::result::Result<bool, String> {
+    let (config_dir, config_dir_explicit) = claude_config_dir()?;
+    let account = claude_keychain_account_name();
+    let api_key_service = claude_keychain_service_name(&config_dir, config_dir_explicit, "");
+
+    if read_keychain_item(&account, &api_key_service).is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(true);
+    }
+
+    let global_config = claude_global_config_path(&config_dir, config_dir_explicit)?;
+    match std::fs::read_to_string(&global_config) {
+        Ok(raw) => {
+            let parsed = serde_json::from_str::<ClaudeGlobalConfig>(&raw)
+                .map_err(|err| format!("failed to parse {}: {err}", global_config.display()))?;
+            Ok(parsed
+                .primary_api_key
+                .is_some_and(|value| !value.trim().is_empty()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("failed to read {}: {err}", global_config.display())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn command_is_claude(program: &std::ffi::OsStr) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        == Some("claude")
+}
+
+#[cfg(target_os = "macos")]
+fn claude_session_has_non_browser_auth(cmd_args: &[std::ffi::OsString]) -> bool {
+    env_non_empty("CLAUDE_CODE_OAUTH_TOKEN")
+        || env_non_empty("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")
+        || env_non_empty("CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
+        || env_non_empty("ANTHROPIC_API_KEY")
+        || env_non_empty("ANTHROPIC_AUTH_TOKEN")
+        || env_non_empty("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR")
+        || env_non_empty("ANTHROPIC_UNIX_SOCKET")
+        || env_truthy("CLAUDE_CODE_USE_BEDROCK")
+        || env_truthy("CLAUDE_CODE_USE_VERTEX")
+        || env_truthy("CLAUDE_CODE_USE_FOUNDRY")
+        || env_truthy("CLAUDE_CODE_SIMPLE")
+        || args_request_bare_mode(cmd_args)
+}
+
+#[cfg(target_os = "macos")]
+fn args_request_bare_mode(cmd_args: &[std::ffi::OsString]) -> bool {
+    cmd_args.iter().any(|arg| arg == "--bare")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn should_auto_enable_claude_launch_services(
+    args: &SandboxArgs,
+    program: &std::ffi::OsStr,
+    cmd_args: &[std::ffi::OsString],
+) -> bool {
+    if args.allow_launch_services
+        || args.profile.as_deref() != Some("claude-code")
+        || !command_is_claude(program)
+        || claude_session_has_non_browser_auth(cmd_args)
+    {
+        return false;
+    }
+
+    match claude_has_saved_api_key_auth() {
+        Ok(true) => return false,
+        Ok(false) => {}
+        Err(err) => {
+            warn!(
+                "Skipping Claude LaunchServices preflight auto-enable because API-key auth detection failed: {}",
+                err
+            );
+            return false;
+        }
+    }
+
+    match load_claude_oauth_state() {
+        Ok(Some(oauth)) => {
+            let has_access = oauth
+                .access_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            let has_refresh = oauth
+                .refresh_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            !has_access || !has_refresh
+        }
+        Ok(None) => true,
+        Err(err) => {
+            warn!(
+                "Skipping Claude LaunchServices preflight auto-enable because OAuth state detection failed: {}",
+                err
+            );
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn should_auto_enable_claude_launch_services(
+    _args: &SandboxArgs,
+    _program: &std::ffi::OsStr,
+    _cmd_args: &[std::ffi::OsString],
+) -> bool {
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -834,6 +1133,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::fs;
     use tempfile::tempdir;
 
     #[cfg(target_os = "macos")]
@@ -849,6 +1150,164 @@ mod tests {
             collect_missing_cli_requested_paths(&args).is_empty(),
             "macOS exact-file grants should not be reported as skipped when the file is absent"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn claude_preflight_env(home: &Path, config_dir: &Path) -> crate::test_env::EnvVarGuard {
+        let env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", home.to_str().unwrap_or("/tmp")),
+            (
+                "CLAUDE_CONFIG_DIR",
+                config_dir.to_str().unwrap_or("/tmp/.claude"),
+            ),
+            ("USER", "nono-test-user"),
+            ("ANTHROPIC_API_KEY", "placeholder"),
+            ("ANTHROPIC_AUTH_TOKEN", "placeholder"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "placeholder"),
+            ("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "9"),
+            ("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "9"),
+            ("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "placeholder"),
+            ("CLAUDE_CODE_CUSTOM_OAUTH_URL", "placeholder"),
+            ("USER_TYPE", "placeholder"),
+            ("USE_LOCAL_OAUTH", "0"),
+            ("USE_STAGING_OAUTH", "0"),
+            ("CLAUDE_CODE_USE_BEDROCK", "0"),
+            ("CLAUDE_CODE_USE_VERTEX", "0"),
+            ("CLAUDE_CODE_USE_FOUNDRY", "0"),
+            ("ANTHROPIC_UNIX_SOCKET", "placeholder"),
+            ("CLAUDE_CODE_SIMPLE", "0"),
+        ]);
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+            "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+            "USER_TYPE",
+            "ANTHROPIC_UNIX_SOCKET",
+            "CLAUDE_CODE_SIMPLE",
+        ] {
+            env.remove(key);
+        }
+        env
+    }
+
+    #[cfg(target_os = "macos")]
+    fn claude_args() -> SandboxArgs {
+        SandboxArgs {
+            profile: Some("claude-code".to_string()),
+            ..SandboxArgs::default()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_oauth_falls_back_to_file_when_keychain_only_has_mcp_oauth() {
+        let oauth = load_claude_oauth_state_from_raw_sources(
+            Some(r#"{"mcpOAuth":{"example":{"accessToken":"mcp-token"}}}"#),
+            Some((
+                r#"{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh"}}"#,
+                "plaintext credentials",
+            )),
+        )
+        .expect("oauth state should parse")
+        .expect("plaintext oauth should win when keychain lacks claudeAiOauth");
+
+        assert_eq!(oauth.access_token.as_deref(), Some("access"));
+        assert_eq!(oauth.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_launch_services_auto_enable_when_auth_missing() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let config_dir = dir.path().join("claude-config");
+        fs::create_dir_all(&home).expect("mkdir home");
+        let _env = claude_preflight_env(&home, &config_dir);
+        let program = std::ffi::OsString::from("claude");
+        let cmd_args = Vec::new();
+
+        assert!(should_auto_enable_claude_launch_services(
+            &claude_args(),
+            &program,
+            &cmd_args
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_launch_services_stays_off_when_refreshable_oauth_exists() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let config_dir = dir.path().join("claude-config");
+        fs::create_dir_all(&config_dir).expect("mkdir config");
+        let _env = claude_preflight_env(&home, &config_dir);
+        fs::write(
+            config_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh"}}"#,
+        )
+        .expect("write credentials");
+        let program = std::ffi::OsString::from("claude");
+        let cmd_args = Vec::new();
+
+        assert!(!should_auto_enable_claude_launch_services(
+            &claude_args(),
+            &program,
+            &cmd_args
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_launch_services_auto_enable_when_refresh_token_missing() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let config_dir = dir.path().join("claude-config");
+        fs::create_dir_all(&config_dir).expect("mkdir config");
+        let _env = claude_preflight_env(&home, &config_dir);
+        fs::write(
+            config_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"access"}}"#,
+        )
+        .expect("write credentials");
+        let program = std::ffi::OsString::from("claude");
+        let cmd_args = Vec::new();
+
+        assert!(should_auto_enable_claude_launch_services(
+            &claude_args(),
+            &program,
+            &cmd_args
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_launch_services_stays_off_when_api_key_auth_exists() {
+        let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        let dir = tempdir().expect("tmpdir");
+        let home = dir.path().join("home");
+        let config_dir = dir.path().join("claude-config");
+        fs::create_dir_all(&config_dir).expect("mkdir config");
+        let _env = claude_preflight_env(&home, &config_dir);
+        fs::write(
+            config_dir.join(".claude.json"),
+            r#"{"primaryApiKey":"sk-ant-api-key"}"#,
+        )
+        .expect("write global config");
+        let program = std::ffi::OsString::from("claude");
+        let cmd_args = Vec::new();
+
+        assert!(!should_auto_enable_claude_launch_services(
+            &claude_args(),
+            &program,
+            &cmd_args
+        ));
     }
 
     #[test]
