@@ -620,7 +620,7 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
 /// Validate env_credentials keys in a profile.
 ///
 /// Keys can be keyring account names, `op://` URIs, `apple-password://` URIs,
-/// `env://` URIs, or `file://` URIs.
+/// `keyring://` URIs, `env://` URIs, or `file://` URIs.
 /// Keyring account names are validated at load time by the keyring crate itself,
 /// but URI entries need structural validation upfront.
 fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
@@ -635,6 +635,10 @@ fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
                     "invalid Apple Passwords URI in env_credentials: {}",
                     e
                 ))
+            })?;
+        } else if nono::keystore::is_keyring_uri(key) {
+            nono::keystore::validate_keyring_uri(key).map_err(|e| {
+                NonoError::ProfileParse(format!("invalid keyring URI in env_credentials: {}", e))
             })?;
         } else if nono::keystore::is_env_uri(key) {
             nono::keystore::validate_env_uri(key).map_err(|e| {
@@ -2078,6 +2082,33 @@ mod tests {
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         let err = validate_env_credential_keys(&profile).expect_err("should reject");
         assert!(err.to_string().contains("Apple Passwords URI"));
+    }
+
+    #[test]
+    fn test_validate_env_credentials_accepts_keyring_uri() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "keyring://gh:github.com/alice": "GH_TOKEN"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert!(validate_env_credential_keys(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_credentials_rejects_invalid_keyring_uri() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "keyring://gh:github.com": "GH_TOKEN"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let err = validate_env_credential_keys(&profile).expect_err("should reject");
+        assert!(err.to_string().contains("keyring URI"));
     }
 
     #[test]

@@ -1,16 +1,18 @@
 //! Secure credential loading from system keystore, 1Password, Apple Passwords, and environment
 //!
 //! This module provides functionality to load secrets from the system keystore
-//! (macOS Keychain / Linux Secret Service), 1Password (via the `op` CLI), or
-//! Apple Passwords (via macOS `security`) or environment variables (via the
-//! `env://` scheme) and return them as zeroized strings.
+//! (macOS Keychain / Linux Secret Service), 1Password (via the `op` CLI),
+//! Apple Passwords (via macOS `security`), custom keyring entries (via the
+//! `keyring` crate), or environment variables (via the `env://` scheme) and
+//! return them as zeroized strings.
 //!
 //! Credential references are dispatched by URI scheme:
 //! - `env://VAR_NAME` — reads from the current process environment
 //! - `file:///path/to/secret` — reads from a local file (before sandbox activation)
 //! - `op://vault/item/field` — loaded via the 1Password CLI
 //! - `apple-password://server/account` — loaded via macOS `security`
-//! - Everything else — loaded from the system keyring
+//! - `keyring://service/account` — loaded from the system keyring with a custom service name
+//! - Everything else — loaded from the system keyring (service name `nono`)
 //!
 //! All secrets are wrapped in `Zeroizing<String>` to ensure they are securely
 //! cleared from memory after use.
@@ -47,6 +49,9 @@ const APPLE_PASSWORD_URI_PREFIX: &str = "apple-password://";
 
 /// Alias prefix for Apple Passwords backend.
 const APPLE_PASSWORDS_URI_PREFIX: &str = "apple-passwords://";
+
+/// The `keyring://` URI scheme prefix, indicating a custom-service keyring lookup.
+const KEYRING_URI_PREFIX: &str = "keyring://";
 
 /// The `env://` URI scheme prefix, indicating environment variable backend.
 const ENV_URI_PREFIX: &str = "env://";
@@ -97,13 +102,14 @@ const FORBIDDEN_URI_CHARS: &[char] = &[
     ';', '|', '&', '$', '`', '(', ')', '{', '}', '<', '>', '!', '\\', '"', '\'', '\n', '\r', '\0',
 ];
 
-/// Load secrets from the system keystore, 1Password, or Apple Passwords
+/// Load secrets from the system keystore, 1Password, Apple Passwords, or keyring
 ///
 /// Credential references with URI schemes are dispatched to their backend:
 /// - `op://` -> 1Password CLI
 /// - `apple-password://` -> macOS security CLI
+/// - `keyring://` -> system keyring with custom service name
 /// - `env://` -> parent process environment
-/// - everything else -> system keyring
+/// - everything else -> system keyring (service name `nono`)
 ///
 /// # Arguments
 /// * `service` - The service name in the keystore (e.g., "nono")
@@ -153,7 +159,8 @@ pub fn load_secrets(
 /// 2. `env://VAR` — reads from the process environment
 /// 3. `op://vault/item/field` — delegates to the 1Password CLI
 /// 4. `apple-password://server/account` — delegates to macOS `security`
-/// 5. Everything else — loads from the system keyring
+/// 5. `keyring://service/account` — loads from system keyring with custom service
+/// 6. Everything else — loads from the system keyring (service name `nono`)
 ///
 /// # Arguments
 /// * `service` - Keyring service name (only used for keyring backend)
@@ -176,6 +183,8 @@ pub fn load_secret_by_ref(service: &str, credential_ref: &str) -> Result<Zeroizi
         load_from_op(credential_ref)
     } else if is_apple_password_uri(credential_ref) {
         load_from_apple_password(credential_ref)
+    } else if is_keyring_uri(credential_ref) {
+        load_from_keyring_uri(credential_ref)
     } else {
         load_single_secret(service, credential_ref)
     }
@@ -324,6 +333,109 @@ fn parse_apple_password_uri(uri: &str) -> Result<(&str, &str)> {
         ))
     })?;
     Ok((server, account))
+}
+
+/// Returns true if the credential reference is a `keyring://` URI.
+#[must_use]
+pub fn is_keyring_uri(credential_ref: &str) -> bool {
+    credential_ref.starts_with(KEYRING_URI_PREFIX)
+}
+
+/// Maximum byte length for a `keyring://` URI (scheme + service + account).
+///
+/// Generous enough for real service/account names but prevents accidentally
+/// passing absurdly long strings to OS keyring APIs.
+const KEYRING_URI_MAX_LEN: usize = 1024;
+
+/// Validate a `keyring://` URI.
+///
+/// Accepted formats:
+/// - `keyring://service/account` — look up by service and account
+///
+/// Rejects:
+/// - Empty service or account
+/// - Characters that could enable argument injection
+/// - URIs with query strings or fragments
+/// - Missing account segment
+/// - URIs exceeding 1024 bytes
+pub fn validate_keyring_uri(uri: &str) -> Result<()> {
+    if uri.len() > KEYRING_URI_MAX_LEN {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI exceeds maximum length of {} bytes",
+            KEYRING_URI_MAX_LEN
+        )));
+    }
+
+    let path = uri.strip_prefix(KEYRING_URI_PREFIX).ok_or_else(|| {
+        NonoError::ConfigParse(format!(
+            "credential reference '{}' does not start with '{}'",
+            uri, KEYRING_URI_PREFIX
+        ))
+    })?;
+
+    if let Some(bad) = path.chars().find(|c| FORBIDDEN_URI_CHARS.contains(c)) {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI contains forbidden character {:?}: {}",
+            bad, uri
+        )));
+    }
+
+    if path.contains('?') || path.contains('#') {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI must not contain query strings or fragments: {}",
+            uri
+        )));
+    }
+
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() != 2 {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI must be 'keyring://service/account': {}",
+            uri
+        )));
+    }
+
+    if segments.iter().any(|s| s.is_empty()) {
+        return Err(NonoError::ConfigParse(format!(
+            "keyring URI has empty service/account segment: {}",
+            uri
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_keyring_uri(uri: &str) -> Result<(&str, &str)> {
+    validate_keyring_uri(uri)?;
+    let path = uri.strip_prefix(KEYRING_URI_PREFIX).ok_or_else(|| {
+        NonoError::ConfigParse(format!(
+            "credential reference '{}' is not a keyring URI",
+            uri
+        ))
+    })?;
+    let mut segments = path.splitn(2, '/');
+    let service = segments.next().ok_or_else(|| {
+        NonoError::ConfigParse(format!("keyring URI missing service segment: {}", uri))
+    })?;
+    let account = segments.next().ok_or_else(|| {
+        NonoError::ConfigParse(format!("keyring URI missing account segment: {}", uri))
+    })?;
+    Ok((service, account))
+}
+
+/// Redact the account segment of a `keyring://` URI for safe logging.
+///
+/// `keyring://service/account` → `keyring://service/<redacted>`
+pub fn redact_keyring_uri(uri: &str) -> String {
+    if let Some(path) = uri.strip_prefix(KEYRING_URI_PREFIX) {
+        let mut segments = path.splitn(2, '/');
+        if let Some(service) = segments.next() {
+            if !service.is_empty() && segments.next().is_some() {
+                return format!("keyring://{}/<redacted>", service);
+            }
+        }
+    }
+    "keyring://***".to_string()
 }
 
 /// Returns true if the credential reference is an `env://` URI.
@@ -825,6 +937,45 @@ fn load_from_apple_password(uri: &str) -> Result<Zeroizing<String>> {
     }
 }
 
+/// Load a secret from the system keyring using a custom service name.
+///
+/// Uses the `keyring` crate with the service and account parsed from a
+/// `keyring://service/account` URI. This is cross-platform: macOS Keychain
+/// (generic passwords), Linux Secret Service, Windows Credential Manager.
+fn load_from_keyring_uri(uri: &str) -> Result<Zeroizing<String>> {
+    let (service, account) = parse_keyring_uri(uri)?;
+    let redacted = redact_keyring_uri(uri);
+    tracing::debug!("Loading secret from system keyring: {}", redacted);
+
+    let entry = keyring::Entry::new(service, account).map_err(|e| {
+        NonoError::KeystoreAccess(format!(
+            "Failed to access keyring for '{}': {}",
+            redacted, e
+        ))
+    })?;
+
+    match entry.get_password() {
+        Ok(password) => {
+            tracing::debug!("Successfully loaded secret '{}'", redacted);
+            Ok(Zeroizing::new(password))
+        }
+        Err(keyring::Error::NoEntry) => Err(NonoError::SecretNotFound(format!(
+            "keyring entry not found: '{}'. \
+             Verify the service and account match the stored credential.",
+            redacted
+        ))),
+        Err(keyring::Error::Ambiguous(creds)) => Err(NonoError::KeystoreAccess(format!(
+            "Multiple entries ({}) found for '{}' - please resolve manually",
+            creds.len(),
+            redacted
+        ))),
+        Err(e) => Err(NonoError::KeystoreAccess(format!(
+            "Cannot access '{}': {}",
+            redacted, e
+        ))),
+    }
+}
+
 /// Classify `op` CLI errors into actionable error messages.
 fn classify_op_error(stderr: &str, uri: &str) -> NonoError {
     let redacted = redact_op_uri(uri);
@@ -989,9 +1140,10 @@ fn wait_with_timeout(
 ///
 /// Bare URI entries without explicit target variables are rejected.
 ///
-/// Apple Passwords references (`apple-password://...`) are not supported in
-/// this list-based parser. Use `build_mappings_from_pairs` (CLI:
-/// `--env-credential-map <CREDENTIAL_REF> <ENV_VAR>`) for explicit mapping.
+/// Apple Passwords references (`apple-password://...`) and keyring references
+/// (`keyring://...`) are not supported in this list-based parser. Use
+/// `build_mappings_from_pairs` (CLI: `--env-credential-map <CREDENTIAL_REF>
+/// <ENV_VAR>`) for explicit mapping.
 ///
 /// Environment URIs (`env://...`) auto-derive the target variable name from the source
 /// when `=` is omitted: `env://GITHUB_TOKEN` maps to env var `GITHUB_TOKEN`.
@@ -999,8 +1151,8 @@ fn wait_with_timeout(
 /// # Errors
 ///
 /// Returns an error if a URI-based secret manager entry is provided without an
-/// explicit target variable suffix, if an Apple Passwords URI is provided in
-/// list mode, or if any URI fails validation.
+/// explicit target variable suffix, if an Apple Passwords or keyring URI is
+/// provided in list mode, or if any URI fails validation.
 ///
 /// # Example
 ///
@@ -1108,6 +1260,12 @@ pub fn build_mappings_from_list(accounts: &str) -> Result<HashMap<String, String
                  Use --env-credential-map 'apple-password://server/account' MY_VAR",
                 redact_apple_password_uri(entry)
             )));
+        } else if is_keyring_uri(entry) {
+            return Err(NonoError::ConfigParse(format!(
+                "keyring credential '{}' is not supported in --env-credential. \
+                 Use --env-credential-map 'keyring://service/account' MY_VAR",
+                redact_keyring_uri(entry)
+            )));
         } else {
             // Keyring name: auto-uppercase to env var name
             let env_var = entry.to_uppercase();
@@ -1150,6 +1308,8 @@ pub fn build_mappings_from_pairs(pairs: &[(String, String)]) -> Result<HashMap<S
             validate_op_uri(credential_ref)?;
         } else if is_apple_password_uri(credential_ref) {
             validate_apple_password_uri(credential_ref)?;
+        } else if is_keyring_uri(credential_ref) {
+            validate_keyring_uri(credential_ref)?;
         } else if credential_ref.starts_with(ENV_URI_PREFIX) {
             validate_env_uri(credential_ref)?;
         }
@@ -1177,7 +1337,8 @@ pub fn build_mappings_from_pairs(pairs: &[(String, String)]) -> Result<HashMap<S
 ///
 /// Returns an error if a URI-based credential in `cli_secrets` is missing
 /// an explicit target variable suffix (`=VAR_NAME` for `op://`), if
-/// `apple-password://` appears in list mode, or if URI/env-var validation fails.
+/// `apple-password://` or `keyring://` appears in list mode, or if
+/// URI/env-var validation fails.
 pub fn build_secret_mappings(
     cli_secrets: Option<&str>,
     cli_secret_mappings: &[(String, String)],
@@ -1385,6 +1546,173 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    // --- keyring:// URI handling in build_mappings_from_list ---
+
+    #[test]
+    fn test_build_mappings_keyring_uri_rejected_in_list_mode() {
+        let err = build_mappings_from_list("keyring://gh:github.com/alice")
+            .expect_err("should reject keyring URI in list mode");
+        assert!(
+            err.to_string().contains("--env-credential-map"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_mappings_keyring_uri_with_inline_var_rejected_in_list_mode() {
+        let err = build_mappings_from_list("keyring://gh:github.com/alice=>GH_TOKEN")
+            .expect_err("should reject inline keyring var syntax");
+        assert!(
+            err.to_string().contains("--env-credential-map"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_mappings_keyring_uri_legacy_equals_suffix_rejected() {
+        let err = build_mappings_from_list("keyring://gh:github.com/alice=GH_TOKEN")
+            .expect_err("should reject legacy inline keyring suffix");
+        assert!(
+            err.to_string().contains("--env-credential-map"),
+            "got: {}",
+            err
+        );
+    }
+
+    // --- keyring:// URI validation tests ---
+
+    #[test]
+    fn test_validate_keyring_uri_valid() {
+        assert!(validate_keyring_uri("keyring://gh:github.com/alice").is_ok());
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_valid_with_special_service() {
+        // Service names can contain colons, dots, etc.
+        assert!(validate_keyring_uri("keyring://com.example.app/user@example.com").is_ok());
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_missing_prefix() {
+        let err = validate_keyring_uri("gh:github.com/alice").expect_err("should reject");
+        assert!(
+            err.to_string().contains("does not start with"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_missing_account() {
+        let err = validate_keyring_uri("keyring://gh:github.com")
+            .expect_err("should reject missing account");
+        assert!(err.to_string().contains("service/account"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_empty_segment() {
+        let err = validate_keyring_uri("keyring://gh:github.com/")
+            .expect_err("should reject empty account");
+        assert!(err.to_string().contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_empty_service() {
+        let err =
+            validate_keyring_uri("keyring:///alice").expect_err("should reject empty service");
+        assert!(err.to_string().contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_forbidden_char() {
+        let err = validate_keyring_uri("keyring://gh:github.com/alice;rm -rf")
+            .expect_err("should reject forbidden char");
+        assert!(
+            err.to_string().contains("forbidden character"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_query_string_rejected() {
+        let err = validate_keyring_uri("keyring://service/account?foo=bar")
+            .expect_err("should reject query string");
+        assert!(err.to_string().contains("query strings"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_keyring_uri_too_many_segments() {
+        let err = validate_keyring_uri("keyring://service/account/extra")
+            .expect_err("should reject extra segments");
+        assert!(err.to_string().contains("service/account"), "got: {}", err);
+    }
+
+    // --- keyring:// URI redaction tests ---
+
+    #[test]
+    fn test_redact_keyring_uri_normal() {
+        assert_eq!(
+            redact_keyring_uri("keyring://gh:github.com/alice"),
+            "keyring://gh:github.com/<redacted>"
+        );
+    }
+
+    #[test]
+    fn test_redact_keyring_uri_malformed() {
+        assert_eq!(redact_keyring_uri("keyring://"), "keyring://***");
+    }
+
+    #[test]
+    fn test_redact_keyring_uri_service_only() {
+        assert_eq!(
+            redact_keyring_uri("keyring://gh:github.com"),
+            "keyring://***"
+        );
+    }
+
+    #[test]
+    fn test_redact_keyring_uri_non_prefix_input() {
+        assert_eq!(redact_keyring_uri("not-a-keyring-uri"), "keyring://***");
+    }
+
+    // --- keyring:// build_mappings_from_pairs tests ---
+
+    #[test]
+    fn test_build_pairs_keyring_uri_valid() {
+        let pairs = vec![(
+            "keyring://gh:github.com/alice".to_string(),
+            "GH_TOKEN".to_string(),
+        )];
+        let mappings = build_mappings_from_pairs(&pairs).expect("should accept valid keyring URI");
+        assert_eq!(
+            mappings.get("keyring://gh:github.com/alice"),
+            Some(&"GH_TOKEN".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_pairs_keyring_uri_invalid() {
+        let pairs = vec![(
+            "keyring://gh:github.com".to_string(),
+            "GH_TOKEN".to_string(),
+        )];
+        let err = build_mappings_from_pairs(&pairs).expect_err("should reject missing account");
+        assert!(err.to_string().contains("service/account"), "got: {}", err);
+    }
+
+    // --- keyring:// length limit test ---
+
+    #[test]
+    fn test_validate_keyring_uri_too_long() {
+        let long_account = "a".repeat(1024);
+        let uri = format!("keyring://service/{}", long_account);
+        let err = validate_keyring_uri(&uri).expect_err("should reject oversized URI");
+        assert!(err.to_string().contains("maximum length"), "got: {}", err);
     }
 
     // --- op:// URI validation tests ---
