@@ -793,15 +793,24 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
             }
         };
         let filter = format!("literal \"{}\"", escaped);
+        // Emit specific ops (file-read-data, file-write-data) in addition to the
+        // wildcards. In Apple's Seatbelt evaluator, a wildcard-op allow does not
+        // override an earlier specific-op deny on an overlapping path (the broad
+        // `deny_keychains_macos` group emits `(deny file-read-data (subpath ...))`).
+        // Emitting the specific op with a literal path ensures the override wins.
         match access {
             AccessMode::Read => {
+                allow_rules.push(format!("(allow file-read-data ({}))", filter));
                 allow_rules.push(format!("(allow file-read* ({}))", filter));
             }
             AccessMode::Write => {
+                allow_rules.push(format!("(allow file-write-data ({}))", filter));
                 allow_rules.push(format!("(allow file-write* ({}))", filter));
             }
             AccessMode::ReadWrite => {
+                allow_rules.push(format!("(allow file-read-data ({}))", filter));
                 allow_rules.push(format!("(allow file-read* ({}))", filter));
+                allow_rules.push(format!("(allow file-write-data ({}))", filter));
                 allow_rules.push(format!("(allow file-write* ({}))", filter));
             }
         }
@@ -838,16 +847,22 @@ pub fn apply_macos_keychain_db_exception(caps: &mut CapabilitySet) {
             ),
         ];
 
+        // See comment above: emit specific ops alongside wildcards so they override
+        // the specific-op denies from deny_keychains_macos.
         for filter in filters {
             match access {
                 AccessMode::Read => {
+                    allow_rules.push(format!("(allow file-read-data ({}))", filter));
                     allow_rules.push(format!("(allow file-read* ({}))", filter));
                 }
                 AccessMode::Write => {
+                    allow_rules.push(format!("(allow file-write-data ({}))", filter));
                     allow_rules.push(format!("(allow file-write* ({}))", filter));
                 }
                 AccessMode::ReadWrite => {
+                    allow_rules.push(format!("(allow file-read-data ({}))", filter));
                     allow_rules.push(format!("(allow file-read* ({}))", filter));
+                    allow_rules.push(format!("(allow file-write-data ({}))", filter));
                     allow_rules.push(format!("(allow file-write* ({}))", filter));
                 }
             }
@@ -2647,6 +2662,25 @@ mod tests {
             "expected login keychain DB write rule, got: {}",
             rules
         );
+        // Specific-op rules must also be emitted so they override the specific-op
+        // deny from deny_keychains_macos: (deny file-read-data (subpath "...Keychains")).
+        // A file-read* wildcard allow does not override a file-read-data specific deny.
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read-data (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB file-read-data rule (to override specific deny), got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-data (literal \"{}\"))",
+                escape_seatbelt_path(login_db.to_str().expect("utf8 path")).expect("escaped path")
+            )),
+            "expected login keychain DB file-write-data rule (to override specific deny), got: {}",
+            rules
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2682,6 +2716,24 @@ mod tests {
                     .expect("escaped path")
             )),
             "expected metadata keychain DB write rule, got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-read-data (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB file-read-data rule (to override specific deny), got: {}",
+            rules
+        );
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-data (literal \"{}\"))",
+                escape_seatbelt_path(metadata_db.to_str().expect("utf8 path"))
+                    .expect("escaped path")
+            )),
+            "expected metadata keychain DB file-write-data rule (to override specific deny), got: {}",
             rules
         );
     }
