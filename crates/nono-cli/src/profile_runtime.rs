@@ -24,6 +24,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_gpu: bool,
     pub(crate) allow_parent_of_protected: bool,
     pub(crate) override_deny_paths: Vec<PathBuf>,
+    pub(crate) allowed_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -206,6 +207,16 @@ fn prepare_profile_with_options(
             &args.override_deny,
             workdir,
         ),
+        allowed_env_vars: loaded_profile.as_ref().and_then(|profile| {
+            profile.environment.as_ref().map(|env_config| {
+                if let Some(err) =
+                    crate::exec_strategy::validate_allow_vars_pattern(&env_config.allow_vars)
+                {
+                    eprintln!("Warning: {}", err);
+                }
+                env_config.allow_vars.clone()
+            })
+        }),
         loaded_profile,
     })
 }

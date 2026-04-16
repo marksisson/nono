@@ -217,6 +217,7 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            allowed_env_vars: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -259,6 +260,7 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            allowed_env_vars: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

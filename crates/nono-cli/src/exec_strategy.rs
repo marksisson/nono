@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
 use env_sanitization::should_skip_env_var;
+pub(crate) use env_sanitization::validate_allow_vars_pattern;
 
 /// Resolve a program name to its absolute path.
 ///
@@ -271,6 +272,10 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
+    /// Allow-list of environment variable names. When set, only variables
+    /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
+    /// passed to the child. Nono-injected credentials always bypass this.
+    pub allowed_env_vars: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -345,7 +350,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.current_dir(config.current_dir);
 
     for (key, value) in std::env::vars() {
-        if !should_skip_env_var(
+        if should_skip_env_var(
             &key,
             &config.env_vars,
             &[
@@ -355,8 +360,14 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
                 DETACHED_CWD_PROMPT_RESPONSE_ENV,
             ],
         ) {
-            cmd.env(&key, &value);
+            continue;
         }
+        if let Some(ref allowed) = config.allowed_env_vars {
+            if !env_sanitization::is_env_var_allowed(&key, allowed) {
+                continue;
+            }
+        }
+        cmd.env(&key, &value);
     }
 
     cmd.args(cmd_args).env("NONO_CAP_FILE", config.cap_file);
@@ -466,7 +477,7 @@ pub fn execute_supervised(
     // Copy current environment, filtering dangerous and overridden vars
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            let should_skip = should_skip_env_var(
+            if should_skip_env_var(
                 k,
                 &config.env_vars,
                 &[
@@ -476,11 +487,16 @@ pub fn execute_supervised(
                     DETACHED_SESSION_ID_ENV,
                     DETACHED_CWD_PROMPT_RESPONSE_ENV,
                 ],
-            );
-            if !should_skip {
-                if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
-                    env_c.push(cstr);
+            ) {
+                continue;
+            }
+            if let Some(ref allowed) = config.allowed_env_vars {
+                if !env_sanitization::is_env_var_allowed(k, allowed) {
+                    continue;
                 }
+            }
+            if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
+                env_c.push(cstr);
             }
         }
     }

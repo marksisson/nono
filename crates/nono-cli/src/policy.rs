@@ -149,6 +149,7 @@ impl ProfileDef {
             policy,
             network: self.network.clone(),
             env_credentials: self.env_credentials.clone(),
+            environment: None,
             workdir: self.workdir.clone(),
             hooks: self.hooks.clone(),
             rollback: self.rollback.clone(),

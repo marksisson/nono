@@ -113,6 +113,7 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
             override_deny_paths: prepared.override_deny_paths,
+            allowed_env_vars: prepared.allowed_env_vars,
             proxy,
             session: SessionLaunchOptions {
                 session_name: args.name,
@@ -181,6 +182,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
             workdir: resolve_requested_workdir(args.workdir.as_ref()),
             no_diagnostics,
             override_deny_paths: prepared.override_deny_paths,
+            allowed_env_vars: prepared.allowed_env_vars,
             ..ExecutionFlags::defaults(silent)?
         },
     })

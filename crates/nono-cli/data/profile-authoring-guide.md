@@ -174,6 +174,24 @@ Supported key formats:
 - Apple Passwords URI: `"apple-password://account/name"`
 - Environment reference: `"env://EXISTING_VAR"`
 
+### environment
+
+Controls which environment variables are passed to the sandboxed process. When `allow_vars` is set, only the listed variables (and nono-injected credentials) are passed through.
+
+```json
+{
+  "environment": {
+    "allow_vars": ["PATH", "HOME", "TERM", "AWS_*"]
+  }
+}
+```
+
+| Field         | Type            | Default | Description |
+|---------------|-----------------|---------|-------------|
+| `allow_vars`  | array of string | `[]`    | Allow-list of environment variable names. Supports exact names (`"PATH"`) and prefix patterns ending with `*` (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.). The `*` wildcard is only valid as a trailing suffix. When the `environment` section is omitted entirely, all variables are allowed. When present with an empty array, no inherited variables are passed (only nono-injected credentials). Nono-injected credentials always bypass this list. |
+
+Inheritance: child `allow_vars` are appended to base values and deduplicated.
+
 ### hooks
 
 Map of application name to hook configuration:
