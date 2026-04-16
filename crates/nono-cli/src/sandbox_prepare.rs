@@ -25,14 +25,21 @@ use tracing::{info, warn};
 
 /// Returns `true` if `profile_name` is `"claude-code"` or transitively extends it.
 fn is_claude_code_profile(profile_name: &str) -> bool {
-    if profile_name == "claude-code" {
-        return true;
+    fn check(name: &str, visited: &mut Vec<String>) -> bool {
+        if name == "claude-code" {
+            return true;
+        }
+        if visited.iter().any(|v| v == name) {
+            return false; // cycle — bail out
+        }
+        visited.push(name.to_string());
+        let bases = match profile::load_profile_extends(name) {
+            Some(bases) => bases,
+            None => return false,
+        };
+        bases.iter().any(|base| check(base, visited))
     }
-    let bases = match profile::load_profile_extends(profile_name) {
-        Some(bases) => bases,
-        None => return false,
-    };
-    bases.iter().any(|base| is_claude_code_profile(base))
+    check(profile_name, &mut Vec::new())
 }
 
 fn collect_missing_cli_requested_paths(args: &SandboxArgs) -> Vec<String> {
