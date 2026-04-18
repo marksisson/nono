@@ -1365,6 +1365,10 @@ pub fn execute_supervised(
                 crate::output::print_diagnostic_footer(&footer);
 
                 if exit_code != 0 {
+                    // Clear the forwarding target before prompting. The child is
+                    // already dead; keeping CHILD_PID set would cause forward_signal
+                    // to send Ctrl-C to the dead PID, swallowing it silently.
+                    clear_signal_forwarding_target();
                     offer_profile_save_for_child(
                         pty_proxy.as_mut(),
                         &prompt_policy_explanations,
@@ -1771,6 +1775,14 @@ extern "C" fn forward_signal(sig: libc::c_int) {
             unsafe {
                 libc::kill(child_raw, sig);
             }
+        }
+    } else {
+        // No child to forward to (e.g. during the post-exit profile-save prompt).
+        // Restore the default handler and re-raise so the signal takes its
+        // default action (terminating nono) rather than being swallowed.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
         }
     }
 }
