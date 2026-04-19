@@ -1607,6 +1607,7 @@ dependencies = [
  "nono-proxy",
  "proptest",
  "rand 0.10.1",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",

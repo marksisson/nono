@@ -1,5 +1,6 @@
 use crate::cli::SandboxArgs;
-use crate::{hooks, profile};
+use crate::{hooks, package, profile};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -33,12 +34,12 @@ struct PrepareProfileOptions {
     hook_output_silent: bool,
 }
 
-fn install_profile_hooks(profile: &profile::Profile, silent: bool) {
+fn install_profile_hooks(profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
     if profile.hooks.hooks.is_empty() {
         return;
     }
 
-    match hooks::install_profile_hooks(&profile.hooks.hooks) {
+    match hooks::install_profile_hooks(profile_name, &profile.hooks.hooks) {
         Ok(results) => {
             for (target, result) in results {
                 match result {
@@ -67,6 +68,168 @@ fn install_profile_hooks(profile: &profile::Profile, silent: bool) {
             }
         }
     }
+}
+
+/// Verify that all packs declared in the profile are installed and intact.
+///
+/// For each pack:
+/// 1. Check the pack directory exists
+/// 2. Verify artifact SHA-256 digests against the lockfile
+/// 3. Re-verify Sigstore bundles from the stored `.nono-trust.bundle` file
+fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
+    if packs.is_empty() {
+        return Ok(());
+    }
+
+    let lockfile = package::read_lockfile()?;
+
+    for pack_ref in packs {
+        let parts: Vec<&str> = pack_ref.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            return Err(nono::NonoError::PackageInstall(format!(
+                "invalid pack reference '{}': expected <namespace>/<name>",
+                pack_ref
+            )));
+        }
+        let (namespace, name) = (parts[0], parts[1]);
+
+        let install_dir = package::package_install_dir(namespace, name)?;
+        if !install_dir.exists() {
+            tracing::warn!(
+                "Pack '{}' declared by profile but not installed. \
+                 Install it with: nono pull {}",
+                pack_ref,
+                pack_ref
+            );
+            continue;
+        }
+
+        let locked = lockfile.packages.get(pack_ref);
+        if let Some(locked_pkg) = locked {
+            for (artifact_name, locked_artifact) in &locked_pkg.artifacts {
+                let artifact_path = install_dir.join(artifact_name);
+                if !artifact_path.exists() {
+                    return Err(nono::NonoError::PackageInstall(format!(
+                        "pack '{}' is missing artifact '{}'. Reinstall with: nono pull {} --force",
+                        pack_ref, artifact_name, pack_ref
+                    )));
+                }
+
+                let bytes = std::fs::read(&artifact_path).map_err(|e| {
+                    nono::NonoError::PackageInstall(format!(
+                        "failed to read artifact '{}' in pack '{}': {}",
+                        artifact_name, pack_ref, e
+                    ))
+                })?;
+                let digest = Sha256::digest(&bytes);
+                let hash = digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                if hash != locked_artifact.sha256 {
+                    return Err(nono::NonoError::PackageInstall(format!(
+                        "pack '{}' artifact '{}' has been tampered with.\n\
+                         Expected: {}\n\
+                         Found:    {}\n\
+                         Reinstall with: nono pull {} --force",
+                        pack_ref, artifact_name, locked_artifact.sha256, hash, pack_ref
+                    )));
+                }
+            }
+        }
+
+        let bundle_path = install_dir.join(".nono-trust.bundle");
+        if bundle_path.exists() {
+            verify_stored_bundles(&install_dir, &bundle_path, pack_ref)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-verify each artifact's Sigstore bundle from the stored trust bundle file.
+fn verify_stored_bundles(
+    install_dir: &Path,
+    bundle_path: &Path,
+    pack_ref: &str,
+) -> crate::Result<()> {
+    let bundle_content = std::fs::read_to_string(bundle_path).map_err(|e| {
+        nono::NonoError::PackageInstall(format!(
+            "failed to read trust bundle for pack '{}': {}",
+            pack_ref, e
+        ))
+    })?;
+
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&bundle_content).map_err(|e| {
+        nono::NonoError::PackageInstall(format!(
+            "failed to parse trust bundle for pack '{}': {}",
+            pack_ref, e
+        ))
+    })?;
+
+    let trusted_root = nono::trust::load_production_trusted_root()?;
+    let policy = nono::trust::VerificationPolicy::default();
+
+    for entry in &entries {
+        let artifact_name = entry
+            .get("artifact")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                nono::NonoError::PackageInstall(format!(
+                    "trust bundle entry missing 'artifact' field in pack '{}'",
+                    pack_ref
+                ))
+            })?;
+
+        let bundle_value = entry.get("bundle").ok_or_else(|| {
+            nono::NonoError::PackageInstall(format!(
+                "trust bundle entry missing 'bundle' field for '{}' in pack '{}'",
+                artifact_name, pack_ref
+            ))
+        })?;
+
+        let artifact_path = install_dir.join(artifact_name);
+        if !artifact_path.exists() {
+            continue;
+        }
+
+        let artifact_bytes = std::fs::read(&artifact_path).map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "failed to read '{}' for bundle verification in pack '{}': {}",
+                artifact_name, pack_ref, e
+            ))
+        })?;
+
+        let bundle_json = serde_json::to_string(bundle_value).map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "failed to serialize bundle for '{}' in pack '{}': {}",
+                artifact_name, pack_ref, e
+            ))
+        })?;
+
+        let bundle = nono::trust::load_bundle_from_str(
+            &bundle_json,
+            Path::new(&format!("{}.bundle", artifact_name)),
+        )?;
+
+        nono::trust::verify_bundle_subject_name(&bundle, Path::new(artifact_name))?;
+        nono::trust::verify_bundle(
+            &artifact_bytes,
+            &bundle,
+            &trusted_root,
+            &policy,
+            Path::new(artifact_name),
+        )
+        .map_err(|e| {
+            nono::NonoError::PackageInstall(format!(
+                "Sigstore verification failed for '{}' in pack '{}': {}\n\
+                 Reinstall with: nono pull {} --force",
+                artifact_name, pack_ref, e, pack_ref
+            ))
+        })?;
+    }
+
+    Ok(())
 }
 
 fn expand_override_deny_path(path: &Path, workdir: &Path) -> PathBuf {
@@ -122,8 +285,14 @@ fn prepare_profile_with_options(
 ) -> crate::Result<PreparedProfile> {
     let loaded_profile = if let Some(ref profile_name) = args.profile {
         let profile = profile::load_profile(profile_name)?;
+        verify_profile_packs(&profile.packs)?;
+
+        if !profile.packs.is_empty() && !options.hook_output_silent {
+            eprintln!("  Verified {} pack(s)", profile.packs.len());
+        }
+
         if options.install_hooks {
-            install_profile_hooks(&profile, options.hook_output_silent);
+            install_profile_hooks(Some(profile_name), &profile, options.hook_output_silent);
         }
         Some(profile)
     } else {

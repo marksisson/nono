@@ -1168,6 +1168,29 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         caps.deduplicate();
     }
 
+    // Grant read access to pack directories declared by the profile
+    if let Some(ref profile) = loaded_profile {
+        for pack_ref in &profile.packs {
+            let parts: Vec<&str> = pack_ref.splitn(2, '/').collect();
+            if parts.len() == 2 {
+                if let Ok(pack_dir) = crate::package::package_install_dir(parts[0], parts[1]) {
+                    if pack_dir.exists() {
+                        if let Ok(canonical) = pack_dir.canonicalize() {
+                            if !caps.path_covered_with_access(&canonical, nono::AccessMode::Read) {
+                                if let Ok(cap) =
+                                    FsCapability::new_dir(canonical, nono::AccessMode::Read)
+                                {
+                                    caps.add_fs(cap);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        caps.deduplicate();
+    }
+
     let active_groups = if let Some(profile) = loaded_profile
         .as_ref()
         .filter(|profile| !profile.security.groups.is_empty())

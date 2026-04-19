@@ -6,6 +6,7 @@ use crate::launch_runtime::{
     select_exec_strategy, ExecutionFlags, LaunchPlan, SessionLaunchOptions,
 };
 use crate::output;
+use crate::profile;
 use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
@@ -14,6 +15,7 @@ use crate::sandbox_prepare::{
 use crate::theme;
 use nono::{NonoError, Result};
 use std::ffi::OsString;
+use std::path::PathBuf;
 use tracing::warn;
 
 pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
@@ -25,7 +27,7 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
 
     let mut command_iter = command.into_iter();
     let program = OsString::from(command_iter.next().ok_or(NonoError::NoCommand)?);
-    let cmd_args: Vec<OsString> = command_iter.map(OsString::from).collect();
+    let mut cmd_args: Vec<OsString> = command_iter.map(OsString::from).collect();
     if should_auto_enable_claude_launch_services(&run_args.sandbox, &program, &cmd_args) {
         warn!(
             "Auto-enabling --allow-launch-services for Claude Code because no refresh-capable local auth was detected"
@@ -33,6 +35,33 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
         run_args.sandbox.allow_launch_services = true;
     }
     let args = run_args.sandbox.clone();
+
+    if let Some(ref profile_name) = args.profile {
+        let loaded = profile::load_profile(profile_name)?;
+        if !loaded.command_args.is_empty() {
+            let all_packs_installed = loaded.packs.iter().all(|pack_ref| {
+                let parts: Vec<&str> = pack_ref.splitn(2, '/').collect();
+                if parts.len() != 2 {
+                    return false;
+                }
+                crate::package::package_install_dir(parts[0], parts[1])
+                    .map(|dir| dir.exists())
+                    .unwrap_or(false)
+            });
+
+            if all_packs_installed || loaded.packs.is_empty() {
+                let workdir = args
+                    .workdir
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                for arg in &loaded.command_args {
+                    let expanded = profile::expand_vars(arg, &workdir)?;
+                    cmd_args.push(OsString::from(expanded));
+                }
+            }
+        }
+    }
 
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;

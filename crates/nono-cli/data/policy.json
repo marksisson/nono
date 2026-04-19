@@ -666,7 +666,7 @@
         "capability_elevation": false
       },
       "filesystem": {
-        "allow": ["$HOME/.claude", "$HOME/.cache/claude", "$HOME/.claude.lock"],
+        "allow": ["$HOME/.claude", "$HOME/.cache/claude", "$HOME/.claude.lock", "$XDG_CONFIG_HOME/nono/profiles"],
         "allow_file": [
           "$HOME/.claude.json",
           "$HOME/.claude.json.lock"
@@ -681,13 +681,6 @@
         "allow_localhost": true
       },
       "allow_launch_services": true,
-      "hooks": {
-        "claude-code": {
-          "event": "PostToolUseFailure",
-          "matcher": "Read|Write|Edit|Bash",
-          "script": "nono-hook.sh"
-        }
-      },
       "undo": {
         "exclude_patterns": ["node_modules", ".next", "__pycache__", "target"],
         "exclude_globs": ["*.tmp.[0-9]*.[0-9]*"]

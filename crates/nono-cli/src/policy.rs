@@ -3,6 +3,7 @@
 //! Parses `policy.json` and resolves named groups into `CapabilitySet` entries
 //! and platform-specific rules using composable, platform-aware groups.
 
+use crate::package;
 use crate::profile;
 use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
 use serde::Deserialize;
@@ -125,6 +126,10 @@ pub struct ProfileDef {
     pub allow_gpu: Option<bool>,
     #[serde(default)]
     pub interactive: bool,
+    #[serde(default)]
+    pub packs: Vec<String>,
+    #[serde(default)]
+    pub command_args: Vec<String>,
 }
 
 impl ProfileDef {
@@ -159,6 +164,8 @@ impl ProfileDef {
             allow_parent_of_protected: None,
             interactive: self.interactive,
             skipdirs: Vec::new(),
+            packs: self.packs.clone(),
+            command_args: self.command_args.clone(),
         }
     }
 }
@@ -626,7 +633,7 @@ pub(crate) fn add_deny_access_rules(
         match resolve_parent_symlinks(&path) {
             Ok(resolved) => resolved,
             Err(e) => {
-                warn!(
+                debug!(
                     "Skipping parent-symlink resolution for {}: {}",
                     path.display(),
                     e
@@ -1314,11 +1321,51 @@ pub fn load_embedded_policy() -> Result<Policy> {
     }
 
     let json = crate::config::embedded::embedded_policy_json();
-    let policy = load_policy(json)?;
+    let mut policy = load_policy(json)?;
+    load_package_groups(&mut policy)?;
     // Another thread may have raced us; that's fine — OnceLock keeps the
     // first value and our `policy` is simply dropped.
     let _ = CACHED.set(policy.clone());
     Ok(policy)
+}
+
+pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
+    // Tolerate missing config dir / lockfile — no packages installed means
+    // no groups to load. This is the common case in tests and fresh installs.
+    let lockfile = match package::read_lockfile() {
+        Ok(lf) => lf,
+        Err(_) => return Ok(()),
+    };
+    for package_key in lockfile.packages.keys() {
+        let (namespace, name) = package_key.split_once('/').ok_or_else(|| {
+            NonoError::PackageInstall(format!("invalid lockfile package key '{package_key}'"))
+        })?;
+        let groups_path = package::package_groups_path(namespace, name)?;
+        if !groups_path.exists() {
+            continue;
+        }
+
+        let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
+            path: groups_path.clone(),
+            source: e,
+        })?;
+
+        let groups: HashMap<String, Group> = serde_json::from_str(&content).map_err(|e| {
+            NonoError::ConfigParse(format!("failed to parse {}: {e}", groups_path.display()))
+        })?;
+
+        for (group_name, group) in groups {
+            if policy.groups.contains_key(&group_name) {
+                return Err(NonoError::PackageInstall(format!(
+                    "package group '{}' collides with an existing policy group",
+                    group_name
+                )));
+            }
+            policy.groups.insert(group_name, group);
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================

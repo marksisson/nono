@@ -118,7 +118,11 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         | nono::NonoError::TrustSigning { .. }
         | nono::NonoError::TrustPolicy(_)
         | nono::NonoError::BlocklistBlocked { .. }
-        | nono::NonoError::InstructionFileDenied { .. } => NonoErrorCode::ErrTrustVerification,
+        | nono::NonoError::InstructionFileDenied { .. }
+        | nono::NonoError::PackageVerification { .. } => NonoErrorCode::ErrTrustVerification,
+        nono::NonoError::PackageInstall(_) | nono::NonoError::RegistryError(_) => {
+            NonoErrorCode::ErrConfigParse
+        }
         nono::NonoError::NetworkFilterUnsupported { .. } => NonoErrorCode::ErrUnsupportedPlatform,
     }
 }

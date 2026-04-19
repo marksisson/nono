@@ -1167,6 +1167,14 @@ pub struct Profile {
     /// Treated like built-in heavy directories (for example `target`).
     #[serde(default)]
     pub skipdirs: Vec<String>,
+    /// Pack dependencies verified at launch before sandbox is applied.
+    /// Each entry is a `<namespace>/<name>` reference to an installed pack.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    /// Extra arguments appended to the child command at launch.
+    /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
+    #[serde(default)]
+    pub command_args: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1208,6 +1216,10 @@ struct ProfileDeserialize {
     interactive: bool,
     #[serde(default)]
     skipdirs: Vec<String>,
+    #[serde(default)]
+    packs: Vec<String>,
+    #[serde(default)]
+    command_args: Vec<String>,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1230,6 +1242,8 @@ impl From<ProfileDeserialize> for Profile {
             allow_parent_of_protected: raw.allow_parent_of_protected,
             interactive: raw.interactive,
             skipdirs: raw.skipdirs,
+            packs: raw.packs,
+            command_args: raw.command_args,
         }
     }
 }
@@ -1255,6 +1269,20 @@ pub fn is_user_override(name: &str) -> bool {
     get_user_profile_path(name)
         .map(|p| p.exists())
         .unwrap_or(false)
+}
+
+/// Return the package directory that owns a profile symlink, if any.
+///
+/// A package-managed profile appears in `~/.config/nono/profiles/` as a symlink
+/// into the package store. This helper resolves that relationship so package
+/// hooks and other assets can be located relative to the installed package.
+#[allow(dead_code)]
+pub fn get_package_for_profile(name: &str) -> Option<PathBuf> {
+    if !is_valid_profile_name(name) {
+        return None;
+    }
+
+    crate::package::is_profile_symlink_into_package_store(name)
 }
 
 /// Load a profile's raw (unresolved) extends target names.
@@ -1301,6 +1329,12 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 /// 1. User profiles from ~/.config/nono/profiles/<name>.json (allows customization)
 /// 2. Built-in profiles (compiled into binary, fallback)
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
+    // Registry reference (namespace/name) — detect before the file path check
+    // since the `/` would otherwise be treated as a path separator.
+    if is_registry_ref(name_or_path) {
+        return load_registry_profile(name_or_path);
+    }
+
     // Direct file path: contains separator or ends with .json
     if name_or_path.contains('/') || name_or_path.ends_with(".json") {
         return load_profile_from_path(Path::new(name_or_path));
@@ -1328,6 +1362,89 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
     }
 
     Err(NonoError::ProfileNotFound(name_or_path.to_string()))
+}
+
+/// Returns true if the string looks like a registry package reference
+/// (`namespace/name` or `namespace/name@version`) rather than a filesystem path.
+fn is_registry_ref(s: &str) -> bool {
+    // Strip optional @version suffix for the path check
+    let path_part = s.split_once('@').map_or(s, |(p, _)| p);
+    let parts: Vec<&str> = path_part.split('/').collect();
+    parts.len() == 2
+        && !s.starts_with('.')
+        && !s.starts_with('~')
+        && !s.starts_with('/')
+        && !s.ends_with(".json")
+        && parts.iter().all(|p| !p.is_empty())
+}
+
+/// Load a profile from a registry pack. If the pack isn't installed locally,
+/// pull it first (Docker-style auto-pull with Sigstore verification).
+fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
+    let package_ref = crate::package::parse_package_ref(name_or_path)?;
+    let install_dir =
+        crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+
+    // Check if pack is already installed
+    if !install_dir.join("package.json").exists() {
+        eprintln!("Profile '{}' not found locally.", package_ref.key());
+
+        // Auto-pull from registry
+        crate::package_cmd::run_pull(crate::cli::PullArgs {
+            package_ref: name_or_path.to_string(),
+            registry: None,
+            force: false,
+            init: false,
+            help: None,
+        })?;
+    }
+
+    // Read manifest to check pack type and find profile artifacts
+    let manifest_path = install_dir.join("package.json");
+    if !manifest_path.exists() {
+        return Err(NonoError::ProfileNotFound(format!(
+            "pack '{}' failed to install",
+            package_ref.key()
+        )));
+    }
+
+    let manifest_json = std::fs::read_to_string(&manifest_path).map_err(NonoError::Io)?;
+    let manifest: crate::package::PackageManifest =
+        serde_json::from_str(&manifest_json).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid package.json in '{}': {e}",
+                package_ref.key()
+            ))
+        })?;
+
+    if manifest.pack_type != crate::package::PackType::Policy {
+        return Err(NonoError::ProfileParse(format!(
+            "'{}' is a {} — only policy packs can be used with --profile.\n\
+             Use 'nono pull {}' to install it instead.",
+            package_ref.key(),
+            manifest.pack_type.label(),
+            package_ref.key()
+        )));
+    }
+
+    // Find the profile JSON in the installed pack
+    for artifact in &manifest.artifacts {
+        if artifact.artifact_type == crate::package::ArtifactType::Profile {
+            let install_name = artifact.install_as.as_deref().unwrap_or(&artifact.path);
+            let profile_path = install_dir
+                .join("profiles")
+                .join(format!("{install_name}.json"));
+            if profile_path.exists() {
+                tracing::info!("Loading registry profile from: {}", profile_path.display());
+                return finalize_profile(load_from_file(&profile_path)?);
+            }
+        }
+    }
+
+    Err(NonoError::ProfileParse(format!(
+        "no profile found in pack '{}'",
+        package_ref.key()
+    )))
 }
 
 /// Load a profile from a direct file path.
@@ -1673,6 +1790,8 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             .or(base.allow_parent_of_protected),
         interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
+        packs: dedup_append(&base.packs, &child.packs),
+        command_args: dedup_append(&base.command_args, &child.command_args),
     }
 }
 
@@ -1844,6 +1963,12 @@ pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
     // Only expand $XDG_RUNTIME_DIR when set; leave literal otherwise
     if let Some(ref rt) = xdg_runtime {
         expanded = expanded.replace("$XDG_RUNTIME_DIR", rt);
+    }
+
+    // Expand $NONO_PACKAGES to the package store directory
+    if expanded.contains("$NONO_PACKAGES") {
+        let packages_dir = crate::package::package_store_dir()?;
+        expanded = expanded.replace("$NONO_PACKAGES", &packages_dir.to_string_lossy());
     }
 
     Ok(PathBuf::from(expanded))
@@ -3029,6 +3154,8 @@ mod tests {
             allow_parent_of_protected: None,
             interactive: false,
             skipdirs: vec!["vendor".to_string()],
+            packs: vec![],
+            command_args: vec![],
         }
     }
 
@@ -3100,6 +3227,8 @@ mod tests {
             allow_parent_of_protected: Some(true),
             interactive: false,
             skipdirs: vec!["dist".to_string()],
+            packs: vec![],
+            command_args: vec![],
         }
     }
 

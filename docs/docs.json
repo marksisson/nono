@@ -40,6 +40,7 @@
       {
         "group": "Features",
         "pages": [
+          "cli/features/package-publishing",
           "cli/features/session-lifecycle",
           "cli/features/profiles-groups",
           "cli/features/profile-authoring",

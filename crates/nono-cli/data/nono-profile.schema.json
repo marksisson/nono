@@ -90,6 +90,16 @@
       "type": "boolean",
       "description": "Deprecated. Parsed for backward compatibility but ignored. Supervised mode preserves TTY by default.",
       "deprecated": true
+    },
+    "packs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pack dependencies verified at launch. Each entry is a namespace/name reference to an installed pack."
+    },
+    "command_args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Extra arguments appended to the child command at launch. Supports variable expansion (e.g. $NONO_PACKAGES)."
     }
   },
   "$defs": {

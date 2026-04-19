@@ -162,6 +162,15 @@ pub enum NonoError {
     #[error("Instruction file denied: {path}: {reason}")]
     InstructionFileDenied { path: String, reason: String },
 
+    #[error("Package install error: {0}")]
+    PackageInstall(String),
+
+    #[error("Package verification failed for {package}: {reason}")]
+    PackageVerification { package: String, reason: String },
+
+    #[error("Registry error: {0}")]
+    RegistryError(String),
+
     // Network errors
     #[error("Per-port network filtering not supported on {platform}: {reason}")]
     NetworkFilterUnsupported { platform: String, reason: String },
