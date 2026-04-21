@@ -16,10 +16,12 @@ There are three trust domains:
 | Domain | Trust Level | Role |
 |--------|-------------|------|
 | Kernel | Fully trusted | Enforces Landlock rules, delivers seccomp notifications, blocks unauthorized syscalls |
-| Supervisor (parent) | Trusted | Receives trapped syscalls, consults approval backend, opens files, injects file descriptors |
+| Supervisor (parent) | Trusted | Records audit events, receives trapped syscalls, consults approval backend, opens files, injects file descriptors |
 | Sandboxed child | Untrusted | Runs the agent command under full kernel enforcement |
 
 The supervisor is trusted but constrained. It can only grant access to files it can open itself (standard Unix permissions apply), and protected nono state roots are checked before any approval backend is consulted.
+
+In supervised mode, audit recording also lives in this trust boundary. The sandboxed child does not write its own audit log. Instead, the trusted parent records session metadata, supervisor-observed events, and optional audit-integrity hashes.
 
 When proxy mode is active, a fourth domain exists:
 
@@ -60,6 +62,8 @@ In supervised mode, the supervisor is already part of the trusted computing base
 - owns the seccomp-notify fd
 - mediates approvals
 - may run rollback snapshots
+- records audit events and session metadata
+- may compute audit-log integrity metadata
 - may run the network proxy
 - manages the session registry and PTY
 

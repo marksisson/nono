@@ -50,6 +50,8 @@ pub(crate) struct RollbackLaunchOptions {
     pub(crate) disabled: bool,
     pub(crate) prompt_disabled: bool,
     pub(crate) audit_disabled: bool,
+    pub(crate) no_audit_integrity: bool,
+    pub(crate) audit_integrity: bool,
     pub(crate) destination: Option<PathBuf>,
     pub(crate) track_all: bool,
     pub(crate) skip_dirs: Vec<String>,
@@ -137,6 +139,7 @@ pub(crate) fn prepare_run_launch_plan(
     let rollback = run_args.rollback;
     let no_rollback_prompt = run_args.no_rollback_prompt;
     let no_audit = run_args.no_audit;
+    let no_audit_integrity = run_args.no_audit_integrity;
     let trust_override = run_args.trust_override;
 
     let mut prepared = prepare_sandbox(&args, silent)?;
@@ -227,6 +230,8 @@ pub(crate) fn prepare_run_launch_plan(
                 disabled: run_args.no_rollback,
                 prompt_disabled: no_rollback_prompt,
                 audit_disabled: no_audit,
+                no_audit_integrity,
+                audit_integrity: run_args.audit_integrity,
                 destination: run_args.rollback_dest,
                 ..rollback_options
             },

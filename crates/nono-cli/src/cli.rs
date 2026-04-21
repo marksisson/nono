@@ -42,7 +42,7 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   attach     Attach to a detached runtime session
   logs       View runtime session event logs
   inspect    Show detailed runtime session state
-  prune      Clean up old runtime session files
+  session    Manage runtime session storage
   rollback   Manage rollback sessions (browse, restore, cleanup)
   audit      View audit trail of sandboxed commands
   trust      Manage file trust and attestation
@@ -224,7 +224,7 @@ pub enum Commands {
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
-  nono rollback list                           # List sessions with file changes
+  nono rollback list                           # List rollback sessions
   nono rollback show <id> --diff               # Show changes with diff
   nono rollback restore <id>                   # Restore files from a session
   nono rollback restore <id> --dry-run         # Preview what would change
@@ -430,7 +430,25 @@ IN-BAND DETACH:
     # Keep only 10 most recent sessions
     nono prune --keep 10
 ")]
+    #[command(hide = true)]
     Prune(PruneArgs),
+
+    /// Manage runtime session storage
+    #[command(subcommand_help_heading = "COMMANDS")]
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono session <command>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono session cleanup --dry-run              # Preview old runtime sessions
+  nono session cleanup --older-than 7         # Remove sessions older than 7 days
+  nono session cleanup --keep 10              # Keep only 10 recent sessions
+")]
+    Session(SessionArgs),
 
     // ── Policy & profiles ────────────────────────────────────────────────
     /// Inspect policy groups, profiles, and security rules
@@ -1307,8 +1325,20 @@ pub struct RunArgs {
     pub no_diagnostics: bool,
 
     /// Disable the audit trail for this session
-    #[arg(long, help_heading = "OPTIONS")]
+    #[arg(
+        long,
+        conflicts_with_all = ["audit_integrity", "no_audit_integrity", "rollback"],
+        help_heading = "OPTIONS"
+    )]
     pub no_audit: bool,
+
+    /// Disable the default Merkleized append-only audit log
+    #[arg(long, conflicts_with_all = ["audit_integrity", "rollback"], help_heading = "OPTIONS")]
+    pub no_audit_integrity: bool,
+
+    /// Add filesystem-state hashing over in-scope writable paths
+    #[arg(long, help_heading = "OPTIONS")]
+    pub audit_integrity: bool,
 
     /// Disable trust verification (not recommended for production)
     #[arg(long, help_heading = "OPTIONS")]
@@ -1526,7 +1556,7 @@ pub struct RollbackArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum RollbackCommands {
-    /// List sessions with file changes
+    /// List rollback sessions
     List(RollbackListArgs),
     /// Show changes in a session
     Show(RollbackShowArgs),
@@ -1549,7 +1579,7 @@ pub struct RollbackListArgs {
     #[arg(long, value_name = "PATH")]
     pub path: Option<PathBuf>,
 
-    /// Show all sessions (including those with no file changes)
+    /// Compatibility flag; rollback sessions are shown by default
     #[arg(long)]
     pub all: bool,
 
@@ -1664,6 +1694,8 @@ pub enum AuditCommands {
     List(AuditListArgs),
     /// Show audit details for a session
     Show(AuditShowArgs),
+    /// Remove old audit sessions
+    Cleanup(AuditCleanupArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -1715,6 +1747,47 @@ pub struct AuditShowArgs {
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct AuditCleanupArgs {
+    /// Retain N newest audit sessions
+    #[arg(long, value_name = "N")]
+    pub keep: Option<usize>,
+
+    /// Remove sessions older than N days
+    #[arg(long, value_name = "DAYS")]
+    pub older_than: Option<u64>,
+
+    /// Show what would be removed without deleting
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Remove all audit sessions (skips active sessions)
+    #[arg(long)]
+    pub all: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommands,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SessionCommands {
+    /// Remove old runtime sessions
+    Cleanup(PruneArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -2270,6 +2343,45 @@ mod tests {
     }
 
     #[test]
+    fn test_audit_cleanup() {
+        let cli = Cli::parse_from(["nono", "audit", "cleanup", "--keep", "5", "--dry-run"]);
+        match cli.command {
+            Commands::Audit(args) => match args.command {
+                AuditCommands::Cleanup(cleanup_args) => {
+                    assert_eq!(cleanup_args.keep, Some(5));
+                    assert!(cleanup_args.dry_run);
+                    assert!(!cleanup_args.all);
+                }
+                _ => panic!("Expected Cleanup subcommand"),
+            },
+            _ => panic!("Expected Audit command"),
+        }
+    }
+
+    #[test]
+    fn test_session_cleanup() {
+        let cli = Cli::parse_from(["nono", "session", "cleanup", "--older-than", "7"]);
+        match cli.command {
+            Commands::Session(args) => match args.command {
+                SessionCommands::Cleanup(cleanup_args) => {
+                    assert_eq!(cleanup_args.older_than, Some(7));
+                    assert!(!cleanup_args.dry_run);
+                }
+            },
+            _ => panic!("Expected Session command"),
+        }
+    }
+
+    #[test]
+    fn test_prune_still_parses_as_hidden_compat_command() {
+        let cli = Cli::parse_from(["nono", "prune", "--dry-run"]);
+        match cli.command {
+            Commands::Prune(args) => assert!(args.dry_run),
+            _ => panic!("Expected hidden Prune command"),
+        }
+    }
+
+    #[test]
     fn test_rollback_verify() {
         let cli = Cli::parse_from(["nono", "rollback", "verify", "20260214-143022-12345"]);
         match cli.command {
@@ -2534,6 +2646,26 @@ mod tests {
             Commands::Run(args) => {
                 assert!(args.no_rollback);
                 assert_eq!(args.rollback_exclude, vec!["target"]);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_no_audit_integrity_flag_parses() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--allow",
+            ".",
+            "--no-audit-integrity",
+            "echo",
+            "hello",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert!(args.no_audit_integrity);
+                assert!(!args.audit_integrity);
             }
             _ => panic!("Expected Run command"),
         }
@@ -2950,7 +3082,7 @@ mod tests {
     /// If you add a new command to the `Commands` enum, add it here too.
     const ALL_SUBCOMMANDS: &[&str] = &[
         "setup", "run", "shell", "wrap", "learn", "why", "ps", "stop", "detach", "attach", "logs",
-        "inspect", "prune", "rollback", "audit", "trust", "policy", "profile", "pull", "remove",
+        "inspect", "session", "rollback", "audit", "trust", "policy", "profile", "pull", "remove",
         "update", "search", "list",
     ];
 

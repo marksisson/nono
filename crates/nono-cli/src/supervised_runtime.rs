@@ -1,3 +1,4 @@
+use crate::audit_integrity::AuditRecorder;
 use crate::launch_runtime::{
     ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
 };
@@ -11,6 +12,7 @@ use crate::{
 };
 use colored::Colorize;
 use nono::{CapabilitySet, Result};
+use std::sync::Mutex;
 
 struct SessionRuntimeState {
     started: String,
@@ -161,12 +163,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         pty_pair,
     } = session_runtime;
 
+    let audit_tracked_paths = crate::rollback_runtime::derive_tracked_paths(caps);
     let rollback_state = initialize_rollback_state(rollback, caps, audit_state.as_ref(), silent)?;
-
-    // When rollback is not active but audit is, compute a pre-execution
-    // merkle root so the audit trail has a cryptographic commitment to
-    // filesystem state.
-    let audit_snapshot_state = if rollback_state.is_none() {
+    let audit_snapshot_state = if rollback_state.is_none() && rollback.audit_integrity {
         match audit_state.as_ref() {
             Some(state) => initialize_audit_snapshots(caps, state, rollback)?,
             None => None,
@@ -174,6 +173,20 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     } else {
         None
     };
+    let audit_recorder = if audit_state.is_some() && !rollback.no_audit_integrity {
+        audit_state
+            .as_ref()
+            .map(|state| AuditRecorder::new(state.session_dir.clone()).map(Mutex::new))
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(recorder_mutex) = audit_recorder.as_ref() {
+        let mut recorder = recorder_mutex
+            .lock()
+            .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
+        recorder.record_session_started(started.clone(), command.to_vec())?;
+    }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
     let approval_backend = terminal_approval::TerminalApproval;
@@ -186,6 +199,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         detach_sequence: session.detach_sequence.as_deref(),
         open_url_origins: &proxy.open_url_origins,
         open_url_allow_localhost: proxy.open_url_allow_localhost,
+        audit_recorder: audit_recorder.as_ref(),
         allow_launch_services_active: proxy.allow_launch_services_active,
         #[cfg(target_os = "linux")]
         proxy_port: match caps.network_mode() {
@@ -226,6 +240,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         audit_state: audit_state.as_ref(),
         rollback_state,
         audit_snapshot_state,
+        audit_tracked_paths,
+        audit_recorder: audit_recorder.as_ref(),
+        audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
         started: &started,
         ended: &ended,

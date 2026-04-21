@@ -3,7 +3,7 @@ title: Audit Trail
 description: Session tracking, filtering, and compliance reporting
 ---
 
-Every sandboxed execution is recorded as an audit session. The audit trail captures what command was run, when, what paths were tracked, what changed, and how the process exited. This gives you a complete history of agent activity for debugging, compliance, and forensic analysis.
+Every supervised execution is recorded as an audit session by default. The audit trail captures what command was run, when, what the supervisor observed, and how the process exited. This gives you a complete history of agent activity for debugging, compliance, and forensic analysis.
 
 ## How It Works
 
@@ -11,11 +11,11 @@ Each session records:
 
 - **Command**: The exact command and arguments
 - **Timestamps**: Start time, end time, duration
-- **Tracked paths**: Which directories were tracked for rollback (if enabled)
-- **Changes**: Files created, modified, or deleted (when rollback is active)
-- **Merkle roots**: Cryptographic commitment to filesystem state at each snapshot (when rollback is active)
 - **Exit code**: How the process terminated
+- **Audit events**: Session start/end plus supervisor-observed events such as capability decisions and URL opens
 - **Network events**: Proxy audit log (when network proxy is active)
+- **Tracked paths / snapshots / Merkle roots**: Filesystem rollback metadata (when `--rollback` is active)
+- **Audit integrity summary**: Optional hash-chain head and Merkle root for the audit event stream (when `--audit-integrity` is active)
 
 Audit is enabled by default for all supervised executions (`nono run`, `nono shell`). No flags are needed.
 
@@ -24,6 +24,20 @@ To disable audit recording for a session, use `--no-audit`:
 ```bash
 nono run --no-audit --allow-cwd -- my-command
 ```
+
+To add tamper-evident integrity metadata for the audit log itself, use `--audit-integrity`:
+
+```bash
+nono run --audit-integrity --allow-cwd -- my-agent
+```
+
+This writes an append-only `audit-events.ndjson` file for the session and stores:
+
+- an event count
+- a hash-chain head over the ordered event stream
+- a Merkle root over all recorded event leaves
+
+This is distinct from rollback. `--audit-integrity` protects the recorded audit log; `--rollback` captures filesystem state and makes it restoreable.
 
 ## Commands
 
@@ -90,13 +104,13 @@ nono audit show 20260214-143022-12345
 nono audit show 20260214-143022-12345 --json
 ```
 
-The JSON output includes all session metadata, snapshot Merkle roots, the full change timeline, and exit status. This format is suitable for ingestion by compliance tools or log aggregators.
+The JSON output includes all recorded session metadata, optional rollback snapshot data, optional audit integrity metadata, and exit status. This format is suitable for ingestion by compliance tools or log aggregators.
 
 ## Use Cases
 
 ### Debugging
 
-When an agent produces unexpected results, the audit trail tells you exactly what files it changed and when:
+When an agent produces unexpected results, the audit trail tells you what the supervisor observed during the run and, when rollback was enabled, exactly what files changed:
 
 ```bash
 # What did the last Claude session do?
@@ -109,7 +123,9 @@ nono audit show <session-id>
 For teams that need to demonstrate control over AI agent activity, the audit trail provides:
 
 - Timestamped proof that sandboxing was active
-- Complete record of filesystem changes with cryptographic integrity (Merkle roots)
+- Structured record of what the supervisor observed
+- Optional tamper-evident integrity metadata for the audit log itself (`--audit-integrity`)
+- Optional complete record of filesystem changes with cryptographic integrity (`--rollback`)
 - Machine-readable JSON export for automated compliance reporting
 
 ### Forensics
@@ -126,19 +142,18 @@ nono audit show <session-id> --json
 
 ## Relationship to Rollbacks
 
-Audit and rollback are independent features that share the same session directory and ID:
+Audit, audit integrity, and rollback are separate layers that share the same session directory and ID:
 
-| Aspect | Audit | Rollback |
-|--------|-------|----------|
-| Default | Always on | Opt-in (`--rollback`) |
-| Opt-out | `--no-audit` | `--no-rollback` |
-| Scope | All supervised sessions | Sessions with writable tracked paths |
-| Purpose | Record keeping | Recovery |
-| Data | Command, timestamps, exit code, network events | Full file content snapshots + Merkle roots |
-| Commands | `nono audit list/show` | `nono rollback list/show/restore/verify/cleanup` |
+| Aspect | Audit | Audit Integrity | Rollback |
+|--------|-------|-----------------|----------|
+| Default | Always on | Opt-in (`--audit-integrity`) | Opt-in (`--rollback`) |
+| Opt-out | `--no-audit` | Disable by omission | `--no-rollback` |
+| Purpose | Record what happened | Detect tampering in the recorded audit log | Restore filesystem state |
+| Data | Command, timestamps, exit code, audit events, network events | Event count, chain head, Merkle root | Full file content snapshots + Merkle roots |
+| Commands | `nono audit list/show` | `nono audit show` | `nono rollback list/show/restore/verify/cleanup` |
 
-When both are active, rollback enriches the audit record with snapshot data (tracked paths, change details, Merkle roots). When only audit is active, the session records metadata without file content.
+When rollback is active, it enriches the audit record with tracked paths, change details, and filesystem Merkle roots. When audit integrity is active, `nono audit show` also includes the event-log integrity summary.
 
 ## Storage
 
-Audit sessions are stored in `~/.nono/rollbacks/`. Audit-only sessions are tiny (a single `session.json` file) and are not subject to rollback storage limits. They accumulate freely and can be cleaned up with `nono rollback cleanup`.
+Audit sessions are stored in `~/.nono/rollbacks/`. Audit-only sessions are small (`session.json`, and `audit-events.ndjson` when `--audit-integrity` is enabled). They share storage with rollback sessions and can be cleaned up with `nono rollback cleanup`.

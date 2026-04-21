@@ -214,6 +214,19 @@ pub struct NetworkAuditEvent {
     pub reason: Option<String>,
 }
 
+/// Summary of append-only integrity metadata for an audit log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditIntegritySummary {
+    /// Hash algorithm used for event leaves and chain/root derivation
+    pub hash_algorithm: String,
+    /// Number of audit events written for the session
+    pub event_count: u64,
+    /// Hash-chain head over the append-only audit log
+    pub chain_head: ContentHash,
+    /// Merkle root over ordered audit event leaves
+    pub merkle_root: ContentHash,
+}
+
 /// Metadata for an undo session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -236,6 +249,12 @@ pub struct SessionMetadata {
     /// Network events captured by the proxy during this session
     #[serde(default)]
     pub network_events: Vec<NetworkAuditEvent>,
+    /// Number of audit events captured for this session
+    #[serde(default)]
+    pub audit_event_count: u64,
+    /// Optional integrity summary for the append-only audit log
+    #[serde(default)]
+    pub audit_integrity: Option<AuditIntegritySummary>,
 }
 
 /// A snapshot manifest capturing filesystem state at a point in time

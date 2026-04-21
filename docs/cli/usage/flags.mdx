@@ -723,14 +723,30 @@ nono run --no-rollback --allow . -- npm test
 
 #### `--no-audit`
 
-Disable the audit trail for this session. By default, every supervised execution records session metadata (command, timestamps, exit code, network events) to `~/.nono/rollbacks/`. Use this flag to suppress audit recording entirely.
+Disable the audit trail for this session. By default, every supervised execution records session metadata and audit events (command, timestamps, exit code, capability decisions, URL opens, network events) to `~/.nono/rollbacks/`. Use this flag to suppress audit recording entirely.
 
 ```bash
 nono run --no-audit --allow-cwd -- my-command
 ```
 
 <Note>
-  `--no-audit` conflicts with `--rollback`. Rollback requires an audit session directory for snapshot storage.
+  `--no-audit` conflicts with `--audit-integrity`. Integrity metadata is computed from the audit event stream.
+</Note>
+
+#### `--audit-integrity`
+
+Enable append-only integrity metadata for the audit log. nono writes an `audit-events.ndjson` stream in session order, hashes each event into a leaf, maintains a running chain head, and stores a final Merkle root in the session metadata. This provides tamper evidence for the recorded audit log without enabling filesystem snapshots.
+
+```bash
+# Default audit events + append-only integrity summary
+nono run --audit-integrity --allow-cwd -- my-agent
+
+# Strongest mode: integrity-protected audit log plus rollback snapshots
+nono run --audit-integrity --rollback --profile claude-code -- claude
+```
+
+<Note>
+  `--audit-integrity` protects the audit log that nono records. It does not replace `--rollback`, which is still the feature that captures filesystem state and restoreable snapshots.
 </Note>
 
 #### `--rollback-exclude`

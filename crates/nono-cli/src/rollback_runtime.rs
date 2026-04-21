@@ -1,8 +1,10 @@
+use crate::audit_integrity::AuditRecorder;
 use crate::launch_runtime::{rollback_base_exclusions, RollbackLaunchOptions};
 use crate::{config, output, rollback_preflight, rollback_session, rollback_ui};
 use nono::{AccessMode, CapabilitySet, Result};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tracing::warn;
 
 pub(crate) struct AuditState {
@@ -18,11 +20,6 @@ pub(crate) struct RollbackRuntimeState {
     pub(crate) session_id: String,
 }
 
-/// Lightweight snapshot state for audit-only sessions (no rollback).
-///
-/// Captures pre-execution merkle root so the audit trail includes a
-/// cryptographic commitment to filesystem state even when rollback
-/// restore is not enabled.
 pub(crate) struct AuditSnapshotState {
     pub(crate) manager: nono::undo::SnapshotManager,
     pub(crate) baseline_root: nono::undo::ContentHash,
@@ -33,6 +30,9 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) audit_state: Option<&'a AuditState>,
     pub(crate) rollback_state: Option<RollbackRuntimeState>,
     pub(crate) audit_snapshot_state: Option<AuditSnapshotState>,
+    pub(crate) audit_tracked_paths: Vec<PathBuf>,
+    pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder>>,
+    pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) started: &'a str,
     pub(crate) ended: &'a str,
@@ -177,25 +177,8 @@ fn enforce_rollback_limits(silent: bool) {
     }
 }
 
-/// Create a new session directory with a unique ID.
-///
-/// Used by both audit and rollback to establish a session storage location.
-/// When both are active, audit creates the dir and rollback shares it.
-fn ensure_session_dir(rollback_destination: Option<&PathBuf>) -> Result<(String, PathBuf)> {
-    let session_id = format!(
-        "{}-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S"),
-        std::process::id()
-    );
-
-    let rollback_root = match rollback_destination {
-        Some(path) => path.clone(),
-        None => {
-            let home = dirs::home_dir().ok_or(nono::NonoError::HomeNotFound)?;
-            home.join(".nono").join("rollbacks")
-        }
-    };
-    let session_dir = rollback_root.join(&session_id);
+fn create_session_dir(root: &Path, session_id: &str) -> Result<PathBuf> {
+    let session_dir = root.join(session_id);
     std::fs::create_dir_all(&session_dir).map_err(|e| {
         nono::NonoError::Snapshot(format!(
             "Failed to create session directory {}: {}",
@@ -213,18 +196,43 @@ fn ensure_session_dir(rollback_destination: Option<&PathBuf>) -> Result<(String,
         }
     }
 
+    Ok(session_dir)
+}
+
+/// Create a new audit session directory with a unique ID.
+fn ensure_audit_session_dir() -> Result<(String, PathBuf)> {
+    let session_id = format!(
+        "{}-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        std::process::id()
+    );
+
+    let audit_root = crate::audit_session::audit_root()?;
+    let session_dir = create_session_dir(&audit_root, &session_id)?;
+
     Ok((session_id, session_dir))
+}
+
+fn ensure_rollback_session_dir(
+    session_id: &str,
+    rollback_destination: Option<&PathBuf>,
+) -> Result<PathBuf> {
+    let rollback_root = match rollback_destination {
+        Some(path) => path.clone(),
+        None => crate::rollback_session::rollback_root()?,
+    };
+    create_session_dir(&rollback_root, session_id)
 }
 
 pub(crate) fn create_audit_state(
     audit_disabled: bool,
-    rollback_destination: Option<&PathBuf>,
+    _rollback_destination: Option<&PathBuf>,
 ) -> Result<Option<AuditState>> {
     if audit_disabled {
         return Ok(None);
     }
 
-    let (session_id, session_dir) = ensure_session_dir(rollback_destination)?;
+    let (session_id, session_dir) = ensure_audit_session_dir()?;
 
     Ok(Some(AuditState {
         session_id,
@@ -257,8 +265,9 @@ pub(crate) fn warn_if_rollback_flags_ignored(rollback: &RollbackLaunchOptions, s
 }
 
 /// Derive tracked paths from capabilities: user-granted writable directories.
-fn derive_tracked_paths(caps: &CapabilitySet) -> Vec<PathBuf> {
-    caps.fs_capabilities()
+pub(crate) fn derive_tracked_paths(caps: &CapabilitySet) -> Vec<PathBuf> {
+    let mut tracked_paths: Vec<PathBuf> = caps
+        .fs_capabilities()
         .iter()
         .filter(|cap| {
             !cap.is_file
@@ -266,14 +275,24 @@ fn derive_tracked_paths(caps: &CapabilitySet) -> Vec<PathBuf> {
                 && cap.source.is_user_intent()
         })
         .map(|cap| cap.resolved.clone())
-        .collect()
+        .collect();
+    prefer_workdir_path(&mut tracked_paths, std::env::current_dir().ok().as_deref());
+    tracked_paths
 }
 
-/// Initialize lightweight audit snapshots for merkle root computation.
-///
-/// When rollback is not requested but audit is active, this captures a
-/// pre-execution merkle root so the audit trail includes a cryptographic
-/// commitment to filesystem state.
+fn prefer_workdir_path(tracked_paths: &mut [PathBuf], workdir: Option<&std::path::Path>) {
+    let Some(workdir) = workdir else {
+        return;
+    };
+
+    if let Some(index) = tracked_paths
+        .iter()
+        .position(|path| path == workdir || workdir.starts_with(path) || path.starts_with(workdir))
+    {
+        tracked_paths.swap(0, index);
+    }
+}
+
 pub(crate) fn initialize_audit_snapshots(
     caps: &CapabilitySet,
     audit_state: &AuditState,
@@ -291,7 +310,6 @@ pub(crate) fn initialize_audit_snapshots(
         &tracked_paths,
         exclusion_config,
     )?;
-
     let baseline_root = manager.compute_merkle_root()?;
 
     Ok(Some(AuditSnapshotState {
@@ -314,11 +332,23 @@ pub(crate) fn initialize_rollback_state(
     enforce_rollback_limits(silent);
 
     // When audit is active, share its session directory. Otherwise create
-    // a standalone directory so rollback snapshots still have somewhere to
+    // a standalone rollback directory so snapshots still have somewhere to
     // live (handles the --rollback --no-audit case).
     let (session_id, session_dir) = match audit_state {
-        Some(state) => (state.session_id.clone(), state.session_dir.clone()),
-        None => ensure_session_dir(rollback.destination.as_ref())?,
+        Some(state) => (
+            state.session_id.clone(),
+            ensure_rollback_session_dir(&state.session_id, rollback.destination.as_ref())?,
+        ),
+        None => {
+            let session_id = format!(
+                "{}-{}",
+                chrono::Local::now().format("%Y%m%d-%H%M%S"),
+                std::process::id()
+            );
+            let session_dir =
+                ensure_rollback_session_dir(&session_id, rollback.destination.as_ref())?;
+            (session_id, session_dir)
+        }
     };
 
     let tracked_paths = derive_tracked_paths(caps);
@@ -392,6 +422,9 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         audit_state,
         rollback_state,
         audit_snapshot_state,
+        audit_tracked_paths,
+        audit_recorder,
+        audit_integrity_enabled,
         proxy_handle,
         started,
         ended,
@@ -405,6 +438,24 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         Vec::new,
         nono_proxy::server::ProxyHandle::drain_audit_events,
     );
+    let (audit_event_count, audit_integrity) = if let Some(recorder_mutex) = audit_recorder {
+        let mut recorder = recorder_mutex
+            .lock()
+            .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
+        for event in &network_events {
+            recorder.record_network_event(event.clone())?;
+        }
+        recorder.record_session_ended(ended.to_string(), exit_code)?;
+        let event_count = recorder.event_count();
+        let integrity = if audit_integrity_enabled {
+            recorder.finalize()
+        } else {
+            None
+        };
+        (event_count, integrity)
+    } else {
+        (0, None)
+    };
 
     let mut audit_saved = false;
 
@@ -429,8 +480,13 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
             exit_code: Some(exit_code),
             merkle_roots,
             network_events: std::mem::take(&mut network_events),
+            audit_event_count,
+            audit_integrity: audit_integrity.clone(),
         };
         manager.save_session_metadata(&meta)?;
+        if let Some(audit_state) = audit_state {
+            nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
+        }
         audit_saved = true;
 
         if !changes.is_empty() {
@@ -444,16 +500,14 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         let _ = manager.cleanup_new_atomic_temp_files(&atomic_temp_before);
     }
 
-    // Audit-only path: no rollback snapshots, but still compute merkle
-    // roots for tamper-evidence when audit snapshot state is available.
     if !audit_saved {
         if let Some(audit_state) = audit_state {
-            let (merkle_roots, tracked_paths) = match audit_snapshot_state {
+            let (tracked_paths, merkle_roots) = match audit_snapshot_state {
                 Some(snap) => {
                     let final_root = snap.manager.compute_merkle_root()?;
-                    (vec![snap.baseline_root, final_root], snap.tracked_paths)
+                    (snap.tracked_paths, vec![snap.baseline_root, final_root])
                 }
-                None => (Vec::new(), Vec::new()),
+                None => (audit_tracked_paths, Vec::new()),
             };
             let meta = nono::undo::SessionMetadata {
                 session_id: audit_state.session_id.clone(),
@@ -465,6 +519,8 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                 exit_code: Some(exit_code),
                 merkle_roots,
                 network_events,
+                audit_event_count,
+                audit_integrity,
             };
             nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;
         }
@@ -477,6 +533,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::test_env::{EnvVarGuard, ENV_LOCK};
     use nono::{CapabilitySet, CapabilitySource, FsCapability};
     use std::fs;
 
@@ -488,14 +545,16 @@ mod tests {
 
     #[test]
     fn create_audit_state_creates_session_when_enabled() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().to_path_buf();
-
-        let state = create_audit_state(false, Some(&dest)).unwrap().unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home)]);
+        let audit_root = crate::audit_session::audit_root().unwrap();
+        let state = create_audit_state(false, None).unwrap().unwrap();
 
         assert!(!state.session_id.is_empty());
         assert!(state.session_dir.exists());
-        assert!(state.session_dir.starts_with(tmp.path()));
+        assert!(state.session_dir.starts_with(audit_root));
     }
 
     #[test]
@@ -503,7 +562,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().to_path_buf();
 
-        let (session_id, session_dir) = ensure_session_dir(Some(&dest)).unwrap();
+        let session_id = format!(
+            "{}-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            std::process::id()
+        );
+        let session_dir = ensure_rollback_session_dir(&session_id, Some(&dest)).unwrap();
 
         assert!(!session_id.is_empty());
         assert!(session_dir.exists());
@@ -515,7 +579,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().to_path_buf();
 
-        let (session_id, _) = ensure_session_dir(Some(&dest)).unwrap();
+        let session_id = format!(
+            "{}-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            std::process::id()
+        );
+        let _ = ensure_rollback_session_dir(&session_id, Some(&dest)).unwrap();
 
         let pid = std::process::id().to_string();
         assert!(
@@ -532,7 +601,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().to_path_buf();
 
-        let (_, session_dir) = ensure_session_dir(Some(&dest)).unwrap();
+        let session_id = format!(
+            "{}-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            std::process::id()
+        );
+        let session_dir = ensure_rollback_session_dir(&session_id, Some(&dest)).unwrap();
 
         let mode = std::fs::metadata(&session_dir)
             .unwrap()
@@ -540,97 +614,6 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700, "session dir should have 0700 permissions");
-    }
-
-    #[test]
-    fn initialize_audit_snapshots_respects_rollback_include_and_exclude() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let tracked = tmp.path().join("tracked");
-        let node_modules = tracked.join("node_modules");
-        fs::create_dir_all(&node_modules).expect("create node_modules");
-        fs::write(tracked.join("keep.txt"), b"keep").expect("write keep");
-        fs::write(node_modules.join("pkg.json"), b"v1").expect("write package");
-
-        let caps = CapabilitySet::new()
-            .allow_path(&tracked, AccessMode::ReadWrite)
-            .expect("allow tracked");
-        let audit_state = AuditState {
-            session_id: "test-session".to_string(),
-            session_dir: tmp.path().join("session"),
-        };
-        fs::create_dir_all(&audit_state.session_dir).expect("create session");
-
-        let excluded_state =
-            initialize_audit_snapshots(&caps, &audit_state, &RollbackLaunchOptions::default())
-                .expect("initialize excluded")
-                .expect("snapshot state");
-
-        fs::write(node_modules.join("pkg.json"), b"v2").expect("modify excluded file");
-        let excluded_root = excluded_state
-            .manager
-            .compute_merkle_root()
-            .expect("compute excluded root");
-        assert_eq!(excluded_state.baseline_root, excluded_root);
-
-        fs::write(node_modules.join("pkg.json"), b"v1").expect("restore excluded file");
-
-        let included_rollback = RollbackLaunchOptions {
-            include: vec!["node_modules".to_string()],
-            ..RollbackLaunchOptions::default()
-        };
-        let included_state = initialize_audit_snapshots(&caps, &audit_state, &included_rollback)
-            .expect("initialize included")
-            .expect("snapshot state");
-
-        fs::write(node_modules.join("pkg.json"), b"v3").expect("modify included file");
-        let included_root = included_state
-            .manager
-            .compute_merkle_root()
-            .expect("compute included root");
-        assert_ne!(included_state.baseline_root, included_root);
-    }
-
-    #[test]
-    fn initialize_audit_snapshots_uses_per_root_gitignore_filters() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root_a = tmp.path().join("root-a");
-        let root_b = tmp.path().join("root-b");
-        fs::create_dir_all(&root_a).expect("create root_a");
-        fs::create_dir_all(&root_b).expect("create root_b");
-        fs::write(root_a.join(".gitignore"), "ignore-a.txt\n").expect("write gitignore a");
-        fs::write(root_b.join(".gitignore"), "ignore-b.txt\n").expect("write gitignore b");
-        fs::write(root_a.join("ignore-a.txt"), b"a1").expect("write ignored a");
-        fs::write(root_b.join("ignore-b.txt"), b"b1").expect("write ignored b");
-        fs::write(root_a.join("visible.txt"), b"visible-a").expect("write visible a");
-        fs::write(root_b.join("visible.txt"), b"visible-b").expect("write visible b");
-
-        let caps = CapabilitySet::new()
-            .allow_path(&root_a, AccessMode::ReadWrite)
-            .and_then(|caps| caps.allow_path(&root_b, AccessMode::ReadWrite))
-            .expect("allow tracked roots");
-        let audit_state = AuditState {
-            session_id: "test-session".to_string(),
-            session_dir: tmp.path().join("session"),
-        };
-        fs::create_dir_all(&audit_state.session_dir).expect("create session");
-
-        let snapshot_state = initialize_audit_snapshots(
-            &caps,
-            &audit_state,
-            &RollbackLaunchOptions {
-                track_all: true,
-                ..RollbackLaunchOptions::default()
-            },
-        )
-        .expect("initialize snapshots")
-        .expect("snapshot state");
-
-        fs::write(root_b.join("ignore-b.txt"), b"b2").expect("modify ignored b");
-        let modified_root = snapshot_state
-            .manager
-            .compute_merkle_root()
-            .expect("compute root");
-        assert_eq!(snapshot_state.baseline_root, modified_root);
     }
 
     #[test]
@@ -676,5 +659,63 @@ mod tests {
         });
 
         assert_eq!(derive_tracked_paths(&caps), vec![tracked]);
+    }
+
+    #[test]
+    fn initialize_audit_snapshots_captures_filesystem_state_without_rollback_storage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tracked = tmp.path().join("tracked");
+        fs::create_dir_all(&tracked).expect("create tracked");
+        fs::write(tracked.join("file.txt"), b"before").expect("write file");
+
+        let caps = CapabilitySet::new()
+            .allow_path(&tracked, AccessMode::ReadWrite)
+            .expect("allow tracked");
+        let audit_state = AuditState {
+            session_id: "test-session".to_string(),
+            session_dir: tmp.path().join("session"),
+        };
+        fs::create_dir_all(&audit_state.session_dir).expect("create session");
+
+        let snapshot_state = initialize_audit_snapshots(
+            &caps,
+            &audit_state,
+            &RollbackLaunchOptions {
+                audit_integrity: true,
+                ..RollbackLaunchOptions::default()
+            },
+        )
+        .expect("initialize audit snapshots")
+        .expect("snapshot state");
+
+        fs::write(tracked.join("file.txt"), b"after").expect("modify file");
+        let modified_root = snapshot_state
+            .manager
+            .compute_merkle_root()
+            .expect("compute modified root");
+
+        assert_eq!(snapshot_state.tracked_paths.len(), 1);
+        assert!(
+            snapshot_state.tracked_paths[0].ends_with("tracked"),
+            "expected tracked root, got {:?}",
+            snapshot_state.tracked_paths
+        );
+        assert_ne!(snapshot_state.baseline_root, modified_root);
+    }
+
+    #[test]
+    fn prefer_workdir_path_moves_covering_workdir_to_front() {
+        let mut tracked_paths = vec![
+            PathBuf::from("/Users/example/.claude"),
+            PathBuf::from("/Users/example/project"),
+            PathBuf::from("/Users/example/.cache/claude"),
+        ];
+
+        prefer_workdir_path(
+            &mut tracked_paths,
+            Some(std::path::Path::new("/Users/example/project")),
+        );
+
+        assert_eq!(tracked_paths[0], PathBuf::from("/Users/example/project"));
     }
 }

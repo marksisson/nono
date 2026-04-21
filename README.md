@@ -96,7 +96,7 @@ Also available as [Python](https://github.com/always-further/nono-py) , [TypeScr
 | **Network filtering** | Allowlist-based host and endpoint filtering via local proxy. Cloud metadata endpoints hard-denied. |
 | **Snapshots** | Content-addressable rollback with SHA-256 dedup and Merkle tree integrity. |
 | **Policy profiles** | Pre-built profiles for popular agents and use cases. Custom profile builder for your own needs. |
-| **Audit logs** | Verifiable logs of all agent actions, with optional remote upload and monitoring. |
+| **Audit logs** | Default event audit for supervised runs, optional append-only integrity hashing, and optional rollback-backed filesystem evidence. |
 | **Cross-platform** | Support for macOS, Linux, and WSL2. Native Windows support in planning. |
 | **Multiplexing** | Run multiple agents in parallel with separate sandboxes. Attach/detach to long-running agents. |
 | **Runs anywhere** | Local CLI, CI pipelines, Containers / Kubernetes, cloud VMs, microVMs. |
