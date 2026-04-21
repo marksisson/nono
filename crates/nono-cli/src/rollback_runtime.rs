@@ -2,6 +2,7 @@ use crate::audit_integrity::AuditRecorder;
 use crate::audit_ledger;
 use crate::launch_runtime::{rollback_base_exclusions, RollbackLaunchOptions};
 use crate::{config, output, rollback_preflight, rollback_session, rollback_ui};
+use nono::undo::ExecutableIdentity;
 use nono::{AccessMode, CapabilitySet, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,7 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder>>,
     pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
+    pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) started: &'a str,
     pub(crate) ended: &'a str,
     pub(crate) command: &'a [String],
@@ -427,6 +429,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         audit_recorder,
         audit_integrity_enabled,
         proxy_handle,
+        executable_identity,
         started,
         ended,
         command,
@@ -476,6 +479,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
             started: started.to_string(),
             ended: Some(ended.to_string()),
             command: command.to_vec(),
+            executable_identity: executable_identity.cloned(),
             tracked_paths,
             snapshot_count: manager.snapshot_count(),
             exit_code: Some(exit_code),
@@ -516,6 +520,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                 started: started.to_string(),
                 ended: Some(ended.to_string()),
                 command: command.to_vec(),
+                executable_identity: executable_identity.cloned(),
                 tracked_paths,
                 snapshot_count: 0,
                 exit_code: Some(exit_code),

@@ -603,6 +603,10 @@ fn print_show_json(session: &SessionInfo) -> Result<()> {
         "started": session.metadata.started,
         "ended": session.metadata.ended,
         "command": session.metadata.command,
+        "executable_identity": session.metadata.executable_identity.as_ref().map(|identity| serde_json::json!({
+            "resolved_path": identity.resolved_path,
+            "sha256": identity.sha256.to_string(),
+        })),
         "tracked_paths": session.metadata.tracked_paths,
         "exit_code": session.metadata.exit_code,
         "merkle_roots": session.metadata.merkle_roots.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
@@ -717,6 +721,7 @@ mod list_tests {
             started: "2026-02-19T10:00:00Z".to_string(),
             ended: None,
             command: vec!["/bin/pwd".to_string()],
+            executable_identity: None,
             tracked_paths: vec![std::path::PathBuf::from("/home/user/widgets")],
             snapshot_count: 0,
             exit_code: Some(0),

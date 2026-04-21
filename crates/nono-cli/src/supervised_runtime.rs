@@ -11,6 +11,7 @@ use crate::{
     DETACHED_SESSION_ID_ENV,
 };
 use colored::Colorize;
+use nono::undo::ExecutableIdentity;
 use nono::{CapabilitySet, Result};
 use std::sync::Mutex;
 
@@ -30,6 +31,7 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) trust: &'a TrustLaunchOptions,
     pub(crate) proxy: &'a ProxyLaunchOptions,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
+    pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) silent: bool,
 }
 
@@ -139,6 +141,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         trust,
         proxy,
         proxy_handle,
+        executable_identity,
         silent,
     } = ctx;
 
@@ -244,6 +247,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         audit_recorder: audit_recorder.as_ref(),
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
+        executable_identity,
         started: &started,
         ended: &ended,
         command,

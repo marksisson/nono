@@ -3,7 +3,7 @@ title: Audit Trail
 description: Session tracking, filtering, and compliance reporting
 ---
 
-Every supervised execution is recorded as an audit session by default. The audit trail captures what command was run, when, what the supervisor observed, and how the process exited. This gives you a complete history of agent activity for debugging, compliance, and forensic analysis.
+Every supervised execution is recorded as an audit session by default. The audit trail captures what command was run, when, what the supervisor observed, and how the process exited. This gives you a history of agent activity for debugging, compliance, and forensics.
 
 ## How It Works
 
@@ -14,10 +14,12 @@ Each session records:
 - **Exit code**: How the process terminated
 - **Audit events**: Session start/end plus supervisor-observed events such as capability decisions and URL opens
 - **Network events**: Proxy audit log (when network proxy is active)
-- **Tracked paths / snapshots / Merkle roots**: Filesystem rollback metadata (when `--rollback` is active)
-- **Audit integrity summary**: Optional hash-chain head and Merkle root for the audit event stream (when `--audit-integrity` is active)
+- **Tracked paths**: Writable policy roots for the session
+- **Merkle roots**: Filesystem-state commitments (when `--audit-integrity` or `--rollback` is active)
+- **Snapshots**: Content-addressable rollback metadata (when `--rollback` is active)
+- **Audit integrity summary**: Hash-chain head and Merkle root for the audit event stream unless disabled with `--no-audit-integrity`
 
-Audit is enabled by default for all supervised executions (`nono run`, `nono shell`). No flags are needed.
+Audit is enabled by default for all supervised executions (`nono run`, `nono shell`). The Merkleized audit event log is also enabled by default.
 
 To disable audit recording for a session, use `--no-audit`:
 
@@ -25,19 +27,25 @@ To disable audit recording for a session, use `--no-audit`:
 nono run --no-audit --allow-cwd -- my-command
 ```
 
-To add tamper-evident integrity metadata for the audit log itself, use `--audit-integrity`:
+To disable the default event-log integrity layer, use `--no-audit-integrity`:
+
+```bash
+nono run --no-audit-integrity --allow-cwd -- my-agent
+```
+
+To add filesystem-state hashing over the in-scope writable paths, use `--audit-integrity`:
 
 ```bash
 nono run --audit-integrity --allow-cwd -- my-agent
 ```
 
-This writes an append-only `audit-events.ndjson` file for the session and stores:
+Every audited session writes an append-only `audit-events.ndjson` file for the session and stores:
 
 - an event count
 - a hash-chain head over the ordered event stream
 - a Merkle root over all recorded event leaves
 
-This is distinct from rollback. `--audit-integrity` protects the recorded audit log; `--rollback` captures filesystem state and makes it restoreable.
+With `--audit-integrity`, nono also walks the tracked writable roots and records pre/post filesystem Merkle roots. `--rollback` goes further by storing content-addressable snapshots that can be restored later.
 
 ## Commands
 
@@ -104,7 +112,7 @@ nono audit show 20260214-143022-12345
 nono audit show 20260214-143022-12345 --json
 ```
 
-The JSON output includes all recorded session metadata, optional rollback snapshot data, optional audit integrity metadata, and exit status. This format is suitable for ingestion by compliance tools or log aggregators.
+The JSON output includes all recorded session metadata, optional filesystem integrity data, optional rollback snapshot data, and exit status. This format is suitable for ingestion by compliance tools or log aggregators.
 
 ## Use Cases
 
@@ -124,8 +132,9 @@ For teams that need to demonstrate control over AI agent activity, the audit tra
 
 - Timestamped proof that sandboxing was active
 - Structured record of what the supervisor observed
-- Optional tamper-evident integrity metadata for the audit log itself (`--audit-integrity`)
-- Optional complete record of filesystem changes with cryptographic integrity (`--rollback`)
+- Tamper-evident integrity metadata for the audit log itself by default
+- Optional filesystem-state commitments over tracked writable roots (`--audit-integrity`)
+- Optional complete record of filesystem changes with restore capability (`--rollback`)
 - Machine-readable JSON export for automated compliance reporting
 
 ### Forensics
@@ -142,18 +151,30 @@ nono audit show <session-id> --json
 
 ## Relationship to Rollbacks
 
-Audit, audit integrity, and rollback are separate layers that share the same session directory and ID:
+Audit, audit integrity, and rollback are separate layers that share the same session ID:
 
 | Aspect | Audit | Audit Integrity | Rollback |
 |--------|-------|-----------------|----------|
-| Default | Always on | Opt-in (`--audit-integrity`) | Opt-in (`--rollback`) |
-| Opt-out | `--no-audit` | Disable by omission | `--no-rollback` |
-| Purpose | Record what happened | Detect tampering in the recorded audit log | Restore filesystem state |
-| Data | Command, timestamps, exit code, audit events, network events | Event count, chain head, Merkle root | Full file content snapshots + Merkle roots |
-| Commands | `nono audit list/show` | `nono audit show` | `nono rollback list/show/restore/verify/cleanup` |
+| Default | Always on | Event-log integrity on by default; filesystem hashing opt-in via `--audit-integrity` | Opt-in (`--rollback`) |
+| Opt-out | `--no-audit` | `--no-audit-integrity` disables event-log integrity | `--no-rollback` |
+| Purpose | Record what happened | Detect tampering in the recorded audit log and optionally commit filesystem state | Restore filesystem state |
+| Data | Command, timestamps, exit code, audit events, network events, tracked paths | Event count, chain head, Merkle root, optional filesystem Merkle roots | Full file content snapshots + Merkle roots |
+| Commands | `nono audit list/show/verify/cleanup` | `nono audit show/verify` | `nono rollback list/show/restore/verify/cleanup` |
 
-When rollback is active, it enriches the audit record with tracked paths, change details, and filesystem Merkle roots. When audit integrity is active, `nono audit show` also includes the event-log integrity summary.
+When rollback is active, it enriches the audit record with snapshots and restore metadata. When filesystem audit integrity is active, `nono audit show` also includes tracked paths and filesystem Merkle roots.
+
+## Limits
+
+The audit trail is intentionally narrow in what it claims to prove.
+
+- The event log is recorded by the trusted supervisor, not by the sandboxed child.
+- The default integrity structure protects the audit event stream for a single session and also records that session into the global audit ledger.
+- Without a future external signature or anchor, this is still host-local tamper evidence, not third-party attestation.
+- `argv` is recorded, but the launched executable binary is not currently hashed. The audit trail tells you what command string ran, not the exact binary bytes that the kernel executed.
+- `--audit-integrity` records filesystem-state Merkle roots over tracked writable paths, but it does not capture rollback objects or restore data. Use `--rollback` for that.
+- Filesystem-state hashing does not attest the full runtime closure of a process. Shared libraries, interpreters, dynamically loaded plugins, and other runtime dependencies are not committed unless separately recorded.
+- `network_events` and rollback metadata are separate recorded structures. They are not a claim of full system provenance or full host compromise detection.
 
 ## Storage
 
-Audit sessions are stored in `~/.nono/rollbacks/`. Audit-only sessions are small (`session.json`, and `audit-events.ndjson` when `--audit-integrity` is enabled). They share storage with rollback sessions and can be cleaned up with `nono rollback cleanup`.
+Audit sessions are stored in `~/.nono/audit/`. Audit-only sessions are small (`session.json` and `audit-events.ndjson`). Clean them up with `nono audit cleanup`.

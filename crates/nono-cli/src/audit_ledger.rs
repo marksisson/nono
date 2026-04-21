@@ -1,13 +1,14 @@
 use crate::audit_session::audit_root;
-use nono::undo::{AuditIntegritySummary, ContentHash, NetworkAuditEvent, SessionMetadata};
+use nix::fcntl::{Flock, FlockArg};
+use nono::undo::{
+    AuditIntegritySummary, ContentHash, ExecutableIdentity, NetworkAuditEvent, SessionMetadata,
+};
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::thread;
-use std::time::Duration;
 
 const AUDIT_LEDGER_FILENAME: &str = "ledger.ndjson";
 const AUDIT_LEDGER_LOCK_FILENAME: &str = "ledger.lock";
@@ -21,6 +22,7 @@ struct SessionDigestPayload<'a> {
     started: &'a str,
     ended: &'a Option<String>,
     command: &'a [String],
+    executable_identity: &'a Option<ExecutableIdentity>,
     tracked_paths: &'a [PathBuf],
     snapshot_count: u32,
     exit_code: &'a Option<i32>,
@@ -65,6 +67,7 @@ pub(crate) fn compute_session_digest(metadata: &SessionMetadata) -> Result<Conte
         started: &metadata.started,
         ended: &metadata.ended,
         command: &metadata.command,
+        executable_identity: &metadata.executable_identity,
         tracked_paths: &metadata.tracked_paths,
         snapshot_count: metadata.snapshot_count,
         exit_code: &metadata.exit_code,
@@ -261,37 +264,30 @@ pub(crate) fn verify_session_in_ledger(
 }
 
 struct LedgerLock {
-    path: PathBuf,
-    _file: std::fs::File,
+    _file: Flock<std::fs::File>,
 }
 
 impl LedgerLock {
     fn acquire(path: PathBuf) -> Result<Self> {
-        for _ in 0..200 {
-            match OpenOptions::new().create_new(true).write(true).open(&path) {
-                Ok(file) => return Ok(Self { path, _file: file }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    return Err(NonoError::Snapshot(format!(
-                        "Failed to acquire audit ledger lock {}: {e}",
-                        path.display()
-                    )));
-                }
-            }
-        }
-
-        Err(NonoError::Snapshot(format!(
-            "Timed out waiting for audit ledger lock {}",
-            path.display()
-        )))
-    }
-}
-
-impl Drop for LedgerLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| {
+                NonoError::Snapshot(format!(
+                    "Failed to open audit ledger lock {}: {e}",
+                    path.display()
+                ))
+            })?;
+        let file = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| {
+            NonoError::Snapshot(format!(
+                "Failed to acquire audit ledger lock {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -329,6 +325,7 @@ fn hash_ledger_link(
 mod tests {
     use super::*;
     use crate::test_env::{EnvVarGuard, ENV_LOCK};
+    use nono::undo::{NetworkAuditDecision, NetworkAuditMode};
 
     fn sample_metadata(id: &str) -> SessionMetadata {
         SessionMetadata {
@@ -336,6 +333,7 @@ mod tests {
             started: "2026-04-21T20:00:00Z".to_string(),
             ended: Some("2026-04-21T20:00:01Z".to_string()),
             command: vec!["/bin/pwd".to_string()],
+            executable_identity: None,
             tracked_paths: vec![PathBuf::from("/tmp/work")],
             snapshot_count: 0,
             exit_code: Some(0),
@@ -361,5 +359,98 @@ mod tests {
         assert!(verified.session_digest_matches);
         assert!(verified.ledger_chain_verified);
         assert_eq!(verified.entry_count, 1);
+    }
+
+    #[test]
+    fn session_digest_changes_when_any_protected_field_changes() {
+        let base = SessionMetadata {
+            session_id: "20260421-200000-11111".to_string(),
+            started: "2026-04-21T20:00:00Z".to_string(),
+            ended: Some("2026-04-21T20:00:01Z".to_string()),
+            command: vec!["/bin/pwd".to_string()],
+            executable_identity: Some(ExecutableIdentity {
+                resolved_path: PathBuf::from("/bin/pwd"),
+                sha256: ContentHash::from_bytes([9; 32]),
+            }),
+            tracked_paths: vec![PathBuf::from("/tmp/work")],
+            snapshot_count: 3,
+            exit_code: Some(7),
+            merkle_roots: vec![ContentHash::from_bytes([1; 32])],
+            network_events: vec![NetworkAuditEvent {
+                timestamp_unix_ms: 5,
+                mode: NetworkAuditMode::Connect,
+                decision: NetworkAuditDecision::Allow,
+                target: "example.com".to_string(),
+                port: Some(443),
+                method: Some("GET".to_string()),
+                path: Some("/".to_string()),
+                status: Some(200),
+                reason: None,
+            }],
+            audit_event_count: 9,
+            audit_integrity: Some(AuditIntegritySummary {
+                hash_algorithm: "sha256".to_string(),
+                event_count: 9,
+                chain_head: ContentHash::from_bytes([2; 32]),
+                merkle_root: ContentHash::from_bytes([3; 32]),
+            }),
+        };
+        let base_digest = compute_session_digest(&base).unwrap();
+
+        let mut changed = base.clone();
+        changed.session_id.push('x');
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.started.push('x');
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.ended = Some("2026-04-21T20:00:02Z".to_string());
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.command.push("--debug".to_string());
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.executable_identity = Some(ExecutableIdentity {
+            resolved_path: PathBuf::from("/usr/bin/pwd"),
+            sha256: ContentHash::from_bytes([9; 32]),
+        });
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.tracked_paths.push(PathBuf::from("/tmp/other"));
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.snapshot_count = changed.snapshot_count.saturating_add(1);
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.exit_code = Some(0);
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.merkle_roots.push(ContentHash::from_bytes([4; 32]));
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.network_events[0].target = "other.example.com".to_string();
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.audit_event_count = changed.audit_event_count.saturating_add(1);
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.audit_integrity = Some(AuditIntegritySummary {
+            hash_algorithm: "sha256".to_string(),
+            event_count: 9,
+            chain_head: ContentHash::from_bytes([8; 32]),
+            merkle_root: ContentHash::from_bytes([3; 32]),
+        });
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
     }
 }

@@ -227,6 +227,15 @@ pub struct AuditIntegritySummary {
     pub merkle_root: ContentHash,
 }
 
+/// Identity of the executable binary launched for a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutableIdentity {
+    /// Canonical path to the executable file hashed by the supervisor.
+    pub resolved_path: PathBuf,
+    /// SHA-256 digest of the executable file contents.
+    pub sha256: ContentHash,
+}
+
 /// Metadata for an undo session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -238,6 +247,9 @@ pub struct SessionMetadata {
     pub ended: Option<String>,
     /// Command that was executed
     pub command: Vec<String>,
+    /// Canonical executable identity hashed by the supervisor before launch
+    #[serde(default)]
+    pub executable_identity: Option<ExecutableIdentity>,
     /// Paths being tracked for changes
     pub tracked_paths: Vec<PathBuf>,
     /// Number of snapshots taken

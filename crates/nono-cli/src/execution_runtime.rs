@@ -2,7 +2,11 @@ use crate::launch_runtime::{select_threading_context, LaunchPlan};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{execute_supervised_runtime, SupervisedRuntimeContext};
 use crate::{command_blocking_deprecation, config, exec_strategy, output, sandbox_state};
+use nono::undo::{ContentHash, ExecutableIdentity};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 use tracing::{error, info};
@@ -50,6 +54,49 @@ fn next_capability_state_file_path() -> std::path::PathBuf {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     std::env::temp_dir().join(format!(".nono-{suffix}.json"))
+}
+
+fn compute_executable_identity(resolved_program: &std::path::Path) -> Result<ExecutableIdentity> {
+    let canonical_path = resolved_program.canonicalize().map_err(|e| {
+        NonoError::CommandExecution(std::io::Error::new(
+            e.kind(),
+            format!(
+                "Failed to canonicalize executable {}: {e}",
+                resolved_program.display()
+            ),
+        ))
+    })?;
+    let mut file = File::open(&canonical_path).map_err(|e| {
+        NonoError::CommandExecution(std::io::Error::new(
+            e.kind(),
+            format!(
+                "Failed to open executable {}: {e}",
+                canonical_path.display()
+            ),
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| {
+            NonoError::CommandExecution(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to read executable {}: {e}",
+                    canonical_path.display()
+                ),
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(ExecutableIdentity {
+        resolved_path: canonical_path,
+        sha256: ContentHash::from_bytes(hasher.finalize().into()),
+    })
 }
 
 pub(crate) fn execution_start_dir(
@@ -162,6 +209,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let proxy_handle = active_proxy.handle;
 
     let current_dir = execution_start_dir(&flags.workdir, &caps)?;
+    let executable_identity = if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
+        Some(compute_executable_identity(&resolved_program)?)
+    } else {
+        None
+    };
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
     let mut env_vars: Vec<(&str, &str)> = loaded_secrets
@@ -265,6 +317,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 trust,
                 proxy,
                 proxy_handle: proxy_handle.as_ref(),
+                executable_identity: executable_identity.as_ref(),
                 silent: flags.silent,
             })?;
 
@@ -324,7 +377,11 @@ fn write_capability_state_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{recommended_builtin_profile, should_apply_startup_timeout};
+    use super::{
+        compute_executable_identity, recommended_builtin_profile, should_apply_startup_timeout,
+    };
+    use sha2::{Digest, Sha256};
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -353,5 +410,21 @@ mod tests {
             &["--version"]
         ));
         assert!(!should_apply_startup_timeout(None, &no_args));
+    }
+
+    #[test]
+    fn compute_executable_identity_hashes_canonical_binary_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("tool");
+        fs::write(&binary, b"#!/bin/sh\necho hello\n").expect("write binary");
+
+        let identity = compute_executable_identity(&binary).expect("compute identity");
+        let expected = Sha256::digest(b"#!/bin/sh\necho hello\n");
+
+        assert_eq!(
+            identity.resolved_path,
+            binary.canonicalize().expect("canonical")
+        );
+        assert_eq!(identity.sha256.as_bytes(), &<[u8; 32]>::from(expected));
     }
 }

@@ -11,6 +11,7 @@ pub(crate) const AUDIT_EVENTS_FILENAME: &str = "audit-events.ndjson";
 const EVENT_DOMAIN: &[u8] = b"nono.audit.event.v1\n";
 const CHAIN_DOMAIN: &[u8] = b"nono.audit.chain.v1\n";
 const MERKLE_NODE_DOMAIN_V2: &[u8] = b"nono.audit.merkle.node.v2\n";
+const MERKLE_NODE_DOMAIN_V3: &[u8] = b"nono.audit.merkle.node.v3\n";
 const HASH_ALGORITHM: &str = "sha256";
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -43,6 +44,8 @@ pub(crate) struct AuditEventRecord {
     pub(crate) prev_chain: Option<ContentHash>,
     pub(crate) leaf_hash: ContentHash,
     pub(crate) chain_hash: ContentHash,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) event_json: Option<String>,
     pub(crate) event: AuditEventPayload,
 }
 
@@ -51,6 +54,7 @@ pub(crate) struct AuditEventRecord {
 pub(crate) enum MerkleScheme {
     LegacyV1,
     DomainSeparatedV2,
+    DomainSeparatedV3,
 }
 
 impl MerkleScheme {
@@ -58,6 +62,7 @@ impl MerkleScheme {
         match self {
             Self::LegacyV1 => "legacy_v1",
             Self::DomainSeparatedV2 => "domain_separated_v2",
+            Self::DomainSeparatedV3 => "domain_separated_v3",
         }
     }
 }
@@ -145,7 +150,7 @@ impl AuditRecorder {
 
     pub(crate) fn finalize(&self) -> Option<AuditIntegritySummary> {
         let chain_head = self.previous_chain?;
-        let merkle_root = merkle_root(&self.leaf_hashes, MerkleScheme::DomainSeparatedV2);
+        let merkle_root = merkle_root(&self.leaf_hashes, MerkleScheme::DomainSeparatedV3);
         Some(AuditIntegritySummary {
             hash_algorithm: HASH_ALGORITHM.to_string(),
             event_count: self.event_count(),
@@ -164,6 +169,11 @@ impl AuditRecorder {
             prev_chain: self.previous_chain,
             leaf_hash,
             chain_hash,
+            event_json: Some(String::from_utf8(event_bytes.clone()).map_err(|e| {
+                NonoError::Snapshot(format!(
+                    "Failed to encode canonical audit event JSON as UTF-8: {e}"
+                ))
+            })?),
             event,
         };
         let line = serde_json::to_vec(&record)
@@ -209,10 +219,28 @@ fn merkle_root(leaves: &[ContentHash], scheme: MerkleScheme) -> ContentHash {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         for pair in level.chunks(2) {
             let left = pair[0];
-            let right = pair.get(1).copied().unwrap_or(left);
+            if pair.len() == 1 {
+                match scheme {
+                    MerkleScheme::LegacyV1 | MerkleScheme::DomainSeparatedV2 => {
+                        let mut hasher = Sha256::new();
+                        if matches!(scheme, MerkleScheme::DomainSeparatedV2) {
+                            hasher.update(MERKLE_NODE_DOMAIN_V2);
+                        }
+                        hasher.update(left);
+                        hasher.update(left);
+                        next.push(hasher.finalize().into());
+                    }
+                    MerkleScheme::DomainSeparatedV3 => next.push(left),
+                }
+                continue;
+            }
+
+            let right = pair[1];
             let mut hasher = Sha256::new();
-            if matches!(scheme, MerkleScheme::DomainSeparatedV2) {
-                hasher.update(MERKLE_NODE_DOMAIN_V2);
+            match scheme {
+                MerkleScheme::LegacyV1 => {}
+                MerkleScheme::DomainSeparatedV2 => hasher.update(MERKLE_NODE_DOMAIN_V2),
+                MerkleScheme::DomainSeparatedV3 => hasher.update(MERKLE_NODE_DOMAIN_V3),
             }
             hasher.update(left);
             hasher.update(right);
@@ -276,12 +304,40 @@ pub(crate) fn verify_audit_log(
             )));
         }
 
-        let event_bytes = serde_json::to_vec(&record.event).map_err(|e| {
-            NonoError::Snapshot(format!(
-                "Failed to serialize audit event for verification at line {}: {e}",
-                index.saturating_add(1)
-            ))
-        })?;
+        let event_bytes = if let Some(raw) = record.event_json.as_ref() {
+            let reparsed: AuditEventPayload = serde_json::from_str(raw).map_err(|e| {
+                NonoError::Snapshot(format!(
+                    "Failed to parse canonical audit event JSON at line {}: {e}",
+                    index.saturating_add(1)
+                ))
+            })?;
+            let reparsed_value = serde_json::to_value(&reparsed).map_err(|e| {
+                NonoError::Snapshot(format!(
+                    "Failed to normalize canonical audit event JSON at line {}: {e}",
+                    index.saturating_add(1)
+                ))
+            })?;
+            let record_value = serde_json::to_value(&record.event).map_err(|e| {
+                NonoError::Snapshot(format!(
+                    "Failed to normalize audit event payload at line {}: {e}",
+                    index.saturating_add(1)
+                ))
+            })?;
+            if reparsed_value != record_value {
+                return Err(NonoError::Snapshot(format!(
+                    "Audit event JSON mismatch at line {}",
+                    index.saturating_add(1)
+                )));
+            }
+            raw.as_bytes().to_vec()
+        } else {
+            serde_json::to_vec(&record.event).map_err(|e| {
+                NonoError::Snapshot(format!(
+                    "Failed to serialize audit event for verification at line {}: {e}",
+                    index.saturating_add(1)
+                ))
+            })?
+        };
         let leaf_hash = hash_event(&event_bytes);
         if record.leaf_hash != leaf_hash {
             return Err(NonoError::Snapshot(format!(
@@ -303,6 +359,11 @@ pub(crate) fn verify_audit_log(
         leaf_hashes.push(leaf_hash);
     }
 
+    let computed_merkle_v3 = if leaf_hashes.is_empty() {
+        None
+    } else {
+        Some(merkle_root(&leaf_hashes, MerkleScheme::DomainSeparatedV3))
+    };
     let computed_merkle_v2 = if leaf_hashes.is_empty() {
         None
     } else {
@@ -316,15 +377,17 @@ pub(crate) fn verify_audit_log(
 
     let (computed_merkle_root, merkle_scheme) = match stored {
         Some(summary) => {
-            if computed_merkle_v2 == Some(summary.merkle_root) {
+            if computed_merkle_v3 == Some(summary.merkle_root) {
+                (computed_merkle_v3, MerkleScheme::DomainSeparatedV3)
+            } else if computed_merkle_v2 == Some(summary.merkle_root) {
                 (computed_merkle_v2, MerkleScheme::DomainSeparatedV2)
             } else if computed_merkle_v1 == Some(summary.merkle_root) {
                 (computed_merkle_v1, MerkleScheme::LegacyV1)
             } else {
-                (computed_merkle_v2, MerkleScheme::DomainSeparatedV2)
+                (computed_merkle_v3, MerkleScheme::DomainSeparatedV3)
             }
         }
-        None => (computed_merkle_v2, MerkleScheme::DomainSeparatedV2),
+        None => (computed_merkle_v3, MerkleScheme::DomainSeparatedV3),
     };
 
     let stored_event_count = stored.map(|s| s.event_count);
@@ -361,6 +424,11 @@ pub(crate) fn verify_audit_log(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use nono::supervisor::{ApprovalDecision, AuditEntry, CapabilityRequest, UrlOpenRequest};
+    use nono::undo::{NetworkAuditDecision, NetworkAuditEvent, NetworkAuditMode};
+    use nono::AccessMode;
+    use std::path::PathBuf;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn recorder_produces_integrity_summary() {
@@ -424,5 +492,117 @@ mod tests {
         let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
         assert_eq!(verified.merkle_scheme, "legacy_v1");
         assert!(verified.merkle_root_matches);
+    }
+
+    #[test]
+    fn verifier_accepts_previous_domain_separated_duplicate_leaf_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started("2026-04-21T00:00:00Z".to_string(), vec!["pwd".to_string()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 0)
+            .unwrap();
+        recorder
+            .record_network_event(NetworkAuditEvent {
+                timestamp_unix_ms: 1,
+                mode: NetworkAuditMode::Connect,
+                decision: NetworkAuditDecision::Allow,
+                target: "example.com".to_string(),
+                port: Some(443),
+                method: None,
+                path: None,
+                status: None,
+                reason: None,
+            })
+            .unwrap();
+
+        let mut summary = recorder.finalize().unwrap();
+        let leaves = read_leaf_hashes(dir.path().join(AUDIT_EVENTS_FILENAME));
+        summary.merkle_root = merkle_root(&leaves, MerkleScheme::DomainSeparatedV2);
+
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(verified.merkle_scheme, "domain_separated_v2");
+        assert!(verified.merkle_root_matches);
+    }
+
+    #[test]
+    fn verifier_round_trips_all_current_audit_event_payload_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+        recorder
+            .record_session_started(
+                "2026-04-21T00:00:00Z".to_string(),
+                vec!["claude".to_string(), "--debug".to_string()],
+            )
+            .unwrap();
+        recorder
+            .record_capability_decision(AuditEntry {
+                timestamp: UNIX_EPOCH + Duration::from_secs(5),
+                request: CapabilityRequest {
+                    request_id: "req-1".to_string(),
+                    path: PathBuf::from("/tmp/example"),
+                    access: AccessMode::ReadWrite,
+                    reason: Some("need scratch space".to_string()),
+                    child_pid: 42,
+                    session_id: "sess-1".to_string(),
+                },
+                decision: ApprovalDecision::Denied {
+                    reason: "outside policy".to_string(),
+                },
+                backend: "terminal".to_string(),
+                duration_ms: 12,
+            })
+            .unwrap();
+        recorder
+            .record_open_url(
+                UrlOpenRequest {
+                    request_id: "open-1".to_string(),
+                    url: "https://example.com/callback".to_string(),
+                    child_pid: 42,
+                    session_id: "sess-1".to_string(),
+                },
+                false,
+                Some("blocked".to_string()),
+            )
+            .unwrap();
+        recorder
+            .record_network_event(NetworkAuditEvent {
+                timestamp_unix_ms: 123,
+                mode: NetworkAuditMode::Reverse,
+                decision: NetworkAuditDecision::Deny,
+                target: "api.example.com".to_string(),
+                port: Some(443),
+                method: Some("POST".to_string()),
+                path: Some("/v1/chat".to_string()),
+                status: Some(403),
+                reason: Some("policy".to_string()),
+            })
+            .unwrap();
+        recorder
+            .record_session_ended("2026-04-21T00:00:01Z".to_string(), 7)
+            .unwrap();
+
+        let summary = recorder.finalize().unwrap();
+        let verified = verify_audit_log(dir.path(), Some(&summary)).unwrap();
+        assert_eq!(verified.event_count, 5);
+        assert_eq!(verified.merkle_scheme, "domain_separated_v3");
+        assert!(verified.records_verified);
+        assert!(verified.chain_head_matches);
+        assert!(verified.merkle_root_matches);
+    }
+
+    fn read_leaf_hashes(path: PathBuf) -> Vec<ContentHash> {
+        let contents = std::fs::read_to_string(path).unwrap();
+        contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str::<AuditEventRecord>(line)
+                    .unwrap()
+                    .leaf_hash
+            })
+            .collect()
     }
 }
