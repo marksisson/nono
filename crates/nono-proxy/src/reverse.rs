@@ -705,7 +705,7 @@ fn validate_http_upstream_target(
         Ok(())
     } else {
         Err(format!(
-            "refusing insecure http upstream for non-local host '{}'; http is only allowed for loopback or unspecified local addresses",
+            "refusing insecure http upstream for non-local host '{}'; http is only allowed for loopback addresses",
             host
         ))
     }
@@ -713,15 +713,12 @@ fn validate_http_upstream_target(
 
 fn is_local_only_target(host: &str, resolved_addrs: &[SocketAddr]) -> bool {
     if !resolved_addrs.is_empty() {
-        return resolved_addrs.iter().all(|addr| {
-            let ip = addr.ip();
-            ip.is_loopback() || ip.is_unspecified()
-        });
+        return resolved_addrs.iter().all(|addr| addr.ip().is_loopback());
     }
 
     match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
         Err(_) => false,
     }
 }
@@ -1503,6 +1500,18 @@ mod tests {
         assert!(
             validate_http_upstream_target(UpstreamScheme::Http, "localhost", &loopback).is_ok()
         );
+    }
+
+    #[test]
+    fn test_validate_http_upstream_target_rejects_unspecified_addresses() {
+        let unspecified = [SocketAddr::from(([0, 0, 0, 0], 8080))];
+        let err = validate_http_upstream_target(UpstreamScheme::Http, "0.0.0.0", &[])
+            .expect_err("unspecified http upstream should be rejected");
+        assert!(err.contains("loopback addresses"));
+
+        let err = validate_http_upstream_target(UpstreamScheme::Http, "localhost", &unspecified)
+            .expect_err("localhost resolving to unspecified should be rejected");
+        assert!(err.contains("loopback addresses"));
     }
 
     #[test]
