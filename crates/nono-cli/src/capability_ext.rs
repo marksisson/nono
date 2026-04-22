@@ -866,20 +866,23 @@ mod tests {
 
     #[test]
     fn test_from_args_rejects_protected_state_subtree() {
-        let home = dirs::home_dir().expect("home");
-        let protected_subtree = home.join(".nono").join("rollbacks");
+        with_env_lock(|| {
+            let home = dirs::home_dir().expect("home");
+            let protected_subtree = home.join(".nono").join("rollbacks");
 
-        let args = SandboxArgs {
-            allow: vec![protected_subtree],
-            ..sandbox_args()
-        };
+            let args = SandboxArgs {
+                allow: vec![protected_subtree],
+                ..sandbox_args()
+            };
 
-        let err = from_args_locked(&args).expect_err("must reject protected state path");
-        assert!(
-            err.to_string()
-                .contains("overlaps protected nono state root"),
-            "unexpected error: {err}",
-        );
+            let err =
+                CapabilitySet::from_args(&args).expect_err("must reject protected state path");
+            assert!(
+                err.to_string()
+                    .contains("overlaps protected nono state root"),
+                "unexpected error: {err}",
+            );
+        });
     }
 
     #[test]

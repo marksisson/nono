@@ -3,52 +3,153 @@ title: Audit Trail
 description: Session tracking, filtering, and compliance reporting
 ---
 
-Every supervised execution is recorded as an audit session by default. The audit trail captures what command was run, when, what the supervisor observed, and how the process exited. This gives you a history of agent activity for debugging, compliance, and forensics.
+Every `nono run` session is recorded by default. nono records the command that ran, the audit events observed during the session, optional filesystem changes, and network events outside the sandbox in the trusted parent process. This gives you a history of agent activity for debugging, compliance, and forensics.
+
+The details of how that record is protected are explained in the [Security Model](/docs/cli/internals/security-model): the trusted supervisor records the session, the event log is committed with a Merkleized integrity structure, and optional signing lets a key holder attest to the completed session.
 
 ## How It Works
 
+<Cards cols={2}>
+  <Card title="Session Audit">
+    One `nono run` from start to finish.
+
+    Answers: "what command ran, when did it start and end, and what did the supervisor record during that run?"
+  </Card>
+  <Card title="Audit-Log Integrity">
+    A tamper-evident structure over the recorded audit events for that session.
+
+    Answers: "has the recorded audit log been modified since it was written?"
+  </Card>
+  <Card title="Filesystem Integrity">
+    Optional hashing of the writable paths that were in scope for the run.
+
+    Answers: "what filesystem state was committed before and after the session under the tracked writable roots?"
+  </Card>
+  <Card title="Rollback">
+    A stronger recovery layer that stores content-addressable snapshots.
+
+    Answers: "can this session's file changes be restored later?"
+  </Card>
+</Cards>
+
+<Callout type="info">
+  By default, `nono` records a session audit and protects the audit event log with an integrity layer. Filesystem hashing and rollback storage are optional extra layers.
+</Callout>
+
 Each session records:
 
-- **Command**: The exact command and arguments
-- **Timestamps**: Start time, end time, duration
-- **Exit code**: How the process terminated
-- **Audit events**: Session start/end plus supervisor-observed events such as capability decisions and URL opens
-- **Network events**: Proxy audit log (when network proxy is active)
-- **Tracked paths**: Writable policy roots for the session
-- **Merkle roots**: Filesystem-state commitments (when `--audit-integrity` or `--rollback` is active)
-- **Snapshots**: Content-addressable rollback metadata (when `--rollback` is active)
-- **Audit integrity summary**: Hash-chain head and Merkle root for the audit event stream unless disabled with `--no-audit-integrity`
-- **Audit attestation**: Optional keyed DSSE signature over the session's audit Merkle root and session context when `--audit-sign-key` is used
+| Field | Meaning |
+|--------|---------|
+| **Command** | The exact command and arguments |
+| **Timestamps** | Start time, end time, duration |
+| **Exit code** | How the process terminated |
+| **Audit events** | Session start/end plus supervisor-observed events such as capability decisions and URL opens |
+| **Network events** | Proxy audit log (when network proxy is active) |
+| **Tracked paths** | Writable policy roots for the session |
+| **Merkle roots** | Filesystem-state commitments (when `--audit-integrity` or `--rollback` is active) |
+| **Snapshots** | Content-addressable rollback metadata (when `--rollback` is active) |
+| **Audit integrity summary** | Hash-chain head and Merkle root for the audit event stream unless disabled with `--no-audit-integrity` |
 
-Audit is enabled by default for all supervised executions (`nono run`, `nono shell`). The Merkleized audit event log is also enabled by default.
+## Modes
 
-To disable audit recording for a session, use `--no-audit`:
+<Tabs>
+  <Tab title="Default">
+    Records the session and protects the recorded event log with the default integrity layer.
 
-```bash
-nono run --no-audit --allow-cwd -- my-command
-```
+    ```bash
+    nono run --allow-cwd -- my-agent
+    ```
+  </Tab>
+  <Tab title="No Audit">
+    Disables audit recording completely for that session.
 
-To disable the default event-log integrity layer, use `--no-audit-integrity`:
+    ```bash
+    nono run --no-audit --allow-cwd -- my-command
+    ```
+  </Tab>
+  <Tab title="No Audit Integrity">
+    Keeps the session audit, but skips the tamper-evident integrity layer for the event log.
 
-```bash
-nono run --no-audit-integrity --allow-cwd -- my-agent
-```
+    ```bash
+    nono run --no-audit-integrity --allow-cwd -- my-agent
+    ```
+  </Tab>
+  <Tab title="Filesystem Integrity">
+    Keeps the session audit, keeps audit-log integrity, and also hashes filesystem state for the tracked writable paths.
 
-To add filesystem-state hashing over the in-scope writable paths, use `--audit-integrity`:
+    ```bash
+    nono run --audit-integrity --allow-cwd -- my-agent
+    ```
+  </Tab>
+  <Tab title="Rollback">
+    Keeps all of the above and also stores rollback snapshots that can be restored later.
 
-```bash
-nono run --audit-integrity --allow-cwd -- my-agent
-```
+    ```bash
+    nono run --rollback --allow-cwd -- my-agent
+    ```
+  </Tab>
+</Tabs>
 
-Every audited session writes an append-only `audit-events.ndjson` file for the session and stores:
+## Terms
 
-- an event count
-- a hash-chain head over the ordered event stream
-- a Merkle root over all recorded event leaves
+Every audited session writes an append-only `audit-events.ndjson` file. In plain terms:
 
-With `--audit-integrity`, nono also walks the tracked writable roots and records pre/post filesystem Merkle roots. `--rollback` goes further by storing content-addressable snapshots that can be restored later.
+| Term | Meaning |
+|------|---------|
+| **Session** | One audited `nono run` |
+| **Audit event** | One recorded fact within that session, such as `session_started`, `session_ended`, a capability decision, or a supervisor-observed URL-open event |
+| **Filesystem-state hashing** | Walking the tracked writable paths and hashing the files under them to commit their state before and after the run |
 
-To have the supervisor sign the audit Merkle root, use `--audit-sign-key`:
+## Integrity Flow
+
+<Steps>
+  <Step title="Record events">
+    The trusted supervisor records audit events during the session into `audit-events.ndjson`.
+  </Step>
+  <Step title="Commit the event stream">
+    When audit-log integrity is enabled, nono stores an event count, a hash-chain head over the ordered event stream, and a Merkle root over all recorded event leaves.
+  </Step>
+  <Step title="Optionally hash filesystem state">
+    With `--audit-integrity`, nono also walks the tracked writable roots and records pre/post filesystem Merkle roots.
+  </Step>
+  <Step title="Optionally store rollback data">
+    With `--rollback`, nono also stores content-addressable snapshots that can be restored later.
+  </Step>
+</Steps>
+
+## Audit Signing
+
+Signing is a separate layer from audit recording, audit-log integrity, filesystem integrity, and rollback.
+
+It answers a different question:
+
+- audit recording: "what happened?"
+- audit-log integrity: "has the recorded audit log changed?"
+- filesystem integrity: "what filesystem state was committed?"
+- **signing**: "did a holder of this signing key attest to this completed session?"
+
+When you use `--audit-sign-key`, the supervisor signs **once per session**, after the run has finished.
+
+<Callout type="warning">
+  `--audit-sign-key` does **not** sign every event individually. It signs once, at session finalization, over the completed session audit root and session context.
+</Callout>
+
+<Steps>
+  <Step title="Record the session">
+    The supervisor records audit events during the run.
+  </Step>
+  <Step title="Build the final root">
+    nono computes the session's final audit Merkle root from those events.
+  </Step>
+  <Step title="Sign once">
+    When the session ends, the supervisor signs that final audit root plus session context.
+  </Step>
+  <Step title="Write the attestation bundle">
+    The resulting DSSE bundle is written into the audit session directory.
+  </Step>
+</Steps>
+
+To have the supervisor sign the completed session audit record, use `--audit-sign-key`:
 
 ```bash
 # Sign with a trust key from the default keystore
@@ -58,7 +159,7 @@ nono run --audit-sign-key default --allow-cwd -- my-agent
 nono run --audit-sign-key op://Development/Nono/audit-key --profile claude-code -- claude
 ```
 
-The signing key is loaded by the trusted supervisor before sandbox activation. The resulting keyed DSSE bundle is written into the session directory as `audit-attestation.bundle`, and a summary is stored in `session.json`.
+The signing key is loaded by the trusted supervisor before sandbox activation. After the session ends, the resulting keyed DSSE bundle is written into the audit session directory as `audit-attestation.bundle`, and a summary is stored in `session.json`.
 
 ## Commands
 

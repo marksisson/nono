@@ -23,6 +23,8 @@ The supervisor is trusted but constrained. It can only grant access to files it 
 
 In supervised mode, audit recording also lives in this trust boundary. The sandboxed child does not write its own audit log. Instead, the trusted parent records session metadata, supervisor-observed events, session-local integrity data, the global audit ledger entry for that session, and any optional audit attestation signature.
 
+In plain terms: the child can generate events by doing things, but it does not control the audit writer. The trusted parent is the component that records the session, commits the event log into the integrity structure, and optionally signs the completed session. That is why the child cannot directly tamper with its own recorded audit trail.
+
 When proxy mode is active, a fourth domain exists:
 
 | Domain | Trust Level | Role |
@@ -262,6 +264,7 @@ The audit subsystem has a narrower security claim than the sandbox itself.
 - The current ledger is still local host state. Without a future signature or external anchor, a host attacker who can rewrite both the session files and the ledger can forge a self-consistent history.
 - For supervised sessions, the supervisor hashes the resolved main executable binary and binds that `{ resolved_path, sha256 }` identity into session metadata and the global audit ledger.
 - When `--audit-sign-key` is configured, the supervisor also signs the session's audit Merkle root and session context using a keyed DSSE/in-toto attestation. The signature is written into the session directory and can later be checked with the corresponding public key.
+- That signature is produced once, at session finalization. nono does not sign each individual audit event.
 - That executable identity is not full runtime provenance. Shared libraries, interpreter chains, scripts passed as arguments, and dynamically loaded runtime dependencies are not covered by that binary hash.
 - The executable hash is computed before `exec`, not from the final kernel-loaded file descriptor. A privileged attacker with write access to the executable path could still race between hash and execution.
 - The keyed audit attestation is only as strong as the signing key distribution model. If the verifier does not pin the expected public key, a rewritten session could also rewrite the embedded public key and remain self-consistent.

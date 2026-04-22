@@ -270,8 +270,27 @@ pub(crate) fn warn_if_rollback_flags_ignored(rollback: &RollbackLaunchOptions, s
     }
 }
 
-/// Derive tracked paths from capabilities: user-granted writable directories.
-pub(crate) fn derive_tracked_paths(caps: &CapabilitySet) -> Vec<PathBuf> {
+/// Derive audit tracked paths from capabilities: user-granted directories.
+///
+/// These paths identify the session scope for audit UX such as `audit list`.
+/// They are intentionally broader than snapshot roots and include read-only
+/// user-granted directories like `--allow-cwd`.
+pub(crate) fn derive_audit_tracked_paths(caps: &CapabilitySet) -> Vec<PathBuf> {
+    let mut tracked_paths: Vec<PathBuf> = caps
+        .fs_capabilities()
+        .iter()
+        .filter(|cap| !cap.is_file && cap.source.is_user_intent())
+        .map(|cap| cap.resolved.clone())
+        .collect();
+    prefer_workdir_path(&mut tracked_paths, std::env::current_dir().ok().as_deref());
+    tracked_paths
+}
+
+/// Derive snapshot tracked paths from capabilities: user-granted writable directories.
+///
+/// These paths define where filesystem hashing and rollback snapshots are
+/// allowed to walk.
+pub(crate) fn derive_snapshot_tracked_paths(caps: &CapabilitySet) -> Vec<PathBuf> {
     let mut tracked_paths: Vec<PathBuf> = caps
         .fs_capabilities()
         .iter()
@@ -313,7 +332,7 @@ pub(crate) fn initialize_audit_snapshots(
     audit_state: &AuditState,
     rollback: &RollbackLaunchOptions,
 ) -> Result<Option<AuditSnapshotState>> {
-    let tracked_paths = derive_tracked_paths(caps);
+    let tracked_paths = derive_snapshot_tracked_paths(caps);
     if tracked_paths.is_empty() {
         return Ok(None);
     }
@@ -366,7 +385,7 @@ pub(crate) fn initialize_rollback_state(
         }
     };
 
-    let tracked_paths = derive_tracked_paths(caps);
+    let tracked_paths = derive_snapshot_tracked_paths(caps);
 
     if tracked_paths.is_empty() {
         return Ok(None);
@@ -662,7 +681,52 @@ mod tests {
     }
 
     #[test]
-    fn derive_tracked_paths_includes_profile_writable_directories() {
+    fn derive_audit_tracked_paths_include_readonly_user_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let readonly = tmp.path().join("readonly");
+        let writable = tmp.path().join("writable");
+        let system = tmp.path().join("system");
+        let file = tmp.path().join("tracked.txt");
+        fs::create_dir_all(&readonly).expect("create readonly dir");
+        fs::create_dir_all(&writable).expect("create writable dir");
+        fs::create_dir_all(&system).expect("create system dir");
+        fs::write(&file, b"content").expect("write tracked file");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: readonly.clone(),
+            resolved: readonly.clone(),
+            access: AccessMode::Read,
+            is_file: false,
+            source: CapabilitySource::Profile,
+        });
+        caps.add_fs(FsCapability {
+            original: writable.clone(),
+            resolved: writable.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::Profile,
+        });
+        caps.add_fs(FsCapability {
+            original: system.clone(),
+            resolved: system.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: false,
+            source: CapabilitySource::System,
+        });
+        caps.add_fs(FsCapability {
+            original: file.clone(),
+            resolved: file,
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        assert_eq!(derive_audit_tracked_paths(&caps), vec![readonly, writable]);
+    }
+
+    #[test]
+    fn derive_snapshot_tracked_paths_include_only_writable_user_directories() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let tracked = tmp.path().join("tracked");
         let system = tmp.path().join("system");
@@ -703,7 +767,7 @@ mod tests {
             source: CapabilitySource::Profile,
         });
 
-        assert_eq!(derive_tracked_paths(&caps), vec![tracked]);
+        assert_eq!(derive_snapshot_tracked_paths(&caps), vec![tracked]);
     }
 
     #[test]

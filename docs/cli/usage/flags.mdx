@@ -737,21 +737,66 @@ nono run --no-audit --allow-cwd -- my-command
 
 Enable append-only integrity metadata for the audit log. nono writes an `audit-events.ndjson` stream in session order, hashes each event into a leaf, maintains a running chain head, and stores a final Merkle root in the session metadata. This provides tamper evidence for the recorded audit log without enabling filesystem snapshots.
 
+Audit flags control three different layers:
+
+- **Session audit**
+  Record what happened during one `nono run`.
+
+- **Audit-log integrity**
+  Make the recorded audit event log tamper-evident with a hash chain and Merkle root.
+
+- **Filesystem integrity**
+  Hash the tracked writable filesystem state before and after the run.
+
+The modes are:
+
+- **Default**
+  Session audit + audit-log integrity
+
+- **`--no-audit`**
+  Disable audit recording completely
+
+- **`--no-audit-integrity`**
+  Keep the session audit, but disable the event-log integrity layer
+
+- **`--audit-integrity`**
+  Keep the default audit behavior and also add filesystem-state hashing
+
+- **`--rollback`**
+  Keep all of the above and also store rollback snapshots for restore
+
 ```bash
-# Default audit events + append-only integrity summary
+# Default: session audit + tamper-evident event log
+nono run --allow-cwd -- my-agent
+
+# Session audit only, without the integrity layer
+nono run --no-audit-integrity --allow-cwd -- my-agent
+
+# Add filesystem-state hashing over tracked writable paths
 nono run --audit-integrity --allow-cwd -- my-agent
 
-# Strongest mode: integrity-protected audit log plus rollback snapshots
+# Strongest mode: audit + filesystem integrity + restoreable rollback snapshots
 nono run --audit-integrity --rollback --profile claude-code -- claude
 ```
 
 <Note>
-  `--audit-integrity` protects the audit log that nono records. It does not replace `--rollback`, which is still the feature that captures filesystem state and restoreable snapshots.
+  `--audit-integrity` adds filesystem-state hashing for the tracked writable paths. `--rollback` is still the feature that stores full restoreable snapshots.
 </Note>
 
 #### `--audit-sign-key`
 
-Sign the session's audit Merkle root with a keyed signing key loaded by the supervisor. The resulting keyed DSSE attestation is written to `audit-attestation.bundle` in the audit session directory, and a summary is recorded in `session.json`.
+Sign the completed session audit record with a keyed signing key loaded by the supervisor.
+
+This happens **once per session**, after the run ends. It does **not** sign every event individually.
+
+The supervisor:
+
+1. records audit events during the session
+2. computes the session's final audit Merkle root
+3. signs that final root plus session context
+4. writes the resulting keyed DSSE attestation to `audit-attestation.bundle`
+
+A summary is also recorded in `session.json`.
 
 Accepted secret references:
 - bare trust key IDs, for example `default`
@@ -780,7 +825,7 @@ nono audit verify <session-id> --public-key-file ./audit-signing-key.pub
 ```
 
 <Note>
-  `--audit-sign-key` signs the session audit Merkle root and session context. It does not, by itself, add an external timestamp, Rekor entry, or full runtime-closure attestation.
+  `--audit-sign-key` signs the session audit Merkle root and session context once, after the session completes. It does not, by itself, add an external timestamp, Rekor entry, or full runtime-closure attestation.
 </Note>
 
 #### `--rollback-exclude`

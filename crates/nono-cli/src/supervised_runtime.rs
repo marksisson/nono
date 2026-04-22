@@ -169,7 +169,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         pty_pair,
     } = session_runtime;
 
-    let audit_tracked_paths = crate::rollback_runtime::derive_tracked_paths(caps);
+    let audit_tracked_paths = crate::rollback_runtime::derive_audit_tracked_paths(caps);
     let rollback_state = initialize_rollback_state(rollback, caps, audit_state.as_ref(), silent)?;
     let audit_snapshot_state = if rollback_state.is_none() && rollback.audit_integrity {
         match audit_state.as_ref() {
