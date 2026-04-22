@@ -62,7 +62,7 @@ pub mod undo;
 // Re-exports for convenience
 pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, IpcMode, NetworkMode,
-    ProcessInfoMode, SignalMode,
+    ProcessInfoMode, SignalMode, UnixSocketCapability, UnixSocketMode, UnixSocketOp,
 };
 pub use diagnostic::{
     CommandContext, DenialReason, DenialRecord, DiagnosticFormatter, DiagnosticMode,

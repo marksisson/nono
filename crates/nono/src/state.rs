@@ -2,7 +2,9 @@
 //!
 //! This module provides serialization of capability state for diagnostic purposes.
 
-use crate::capability::{AccessMode, CapabilitySet, FsCapability};
+use crate::capability::{
+    AccessMode, CapabilitySet, FsCapability, UnixSocketCapability, UnixSocketMode,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -11,6 +13,10 @@ use std::path::PathBuf;
 pub struct SandboxState {
     /// Filesystem capabilities
     pub fs: Vec<FsCapState>,
+    /// AF_UNIX socket capabilities (may be absent in states persisted
+    /// by older nono builds; `#[serde(default)]` preserves backward compat).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unix_sockets: Vec<UnixSocketCapState>,
     /// Whether network is blocked
     pub net_blocked: bool,
 }
@@ -28,6 +34,19 @@ pub struct FsCapState {
     pub is_file: bool,
 }
 
+/// Serializable representation of a [`UnixSocketCapability`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnixSocketCapState {
+    /// Original path as specified
+    pub original: PathBuf,
+    /// Resolved canonical path
+    pub resolved: PathBuf,
+    /// Whether the grant is directory-scoped (non-recursive)
+    pub is_directory: bool,
+    /// Mode string: "connect" or "connect+bind"
+    pub mode: String,
+}
+
 impl SandboxState {
     /// Create state from a capability set
     #[must_use]
@@ -41,6 +60,16 @@ impl SandboxState {
                     resolved: cap.resolved.clone(),
                     access: cap.access.to_string(),
                     is_file: cap.is_file,
+                })
+                .collect(),
+            unix_sockets: caps
+                .unix_socket_capabilities()
+                .iter()
+                .map(|cap| UnixSocketCapState {
+                    original: cap.original.clone(),
+                    resolved: cap.resolved.clone(),
+                    is_directory: cap.is_directory,
+                    mode: cap.mode.to_string(),
                 })
                 .collect(),
             net_blocked: caps.is_network_blocked(),
@@ -77,6 +106,27 @@ impl SandboxState {
                 FsCapability::new_dir(&fs_cap.original, access)?
             };
             caps.add_fs(cap);
+        }
+
+        for sock in &self.unix_sockets {
+            let mode = match sock.mode.as_str() {
+                "connect" => UnixSocketMode::Connect,
+                "connect+bind" => UnixSocketMode::ConnectBind,
+                other => {
+                    return Err(crate::error::NonoError::ConfigParse(format!(
+                        "invalid unix socket mode in sandbox state: {other}"
+                    )));
+                }
+            };
+
+            // Re-validate through the standard constructors to ensure
+            // canonicalisation and existence checks are applied.
+            let cap = if sock.is_directory {
+                UnixSocketCapability::new_dir(&sock.original, mode)?
+            } else {
+                UnixSocketCapability::new_file(&sock.original, mode)?
+            };
+            caps.add_unix_socket(cap);
         }
 
         caps.set_network_blocked(self.net_blocked);
