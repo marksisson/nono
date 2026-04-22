@@ -191,9 +191,11 @@ pub async fn handle_reverse_proxy(
 
     let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
         parse_upstream_url(&upstream_url)?;
-    if let Err(reason) = validate_http_upstream_target(upstream_scheme, &upstream_host) {
-        warn!("{}", reason);
-        send_error(stream, 502, "Bad Gateway").await?;
+    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        warn!("Upstream host denied by filter: {}", reason);
+        send_error(stream, 403, "Forbidden").await?;
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
@@ -203,11 +205,11 @@ pub async fn handle_reverse_proxy(
         );
         return Ok(());
     }
-    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
-    if !check.result.is_allowed() {
-        let reason = check.result.reason();
-        warn!("Upstream host denied by filter: {}", reason);
-        send_error(stream, 403, "Forbidden").await?;
+    if let Err(reason) =
+        validate_http_upstream_target(upstream_scheme, &upstream_host, &check.resolved_addrs)
+    {
+        warn!("{}", reason);
+        send_error(stream, 502, "Bad Gateway").await?;
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
@@ -363,9 +365,12 @@ async fn handle_oauth2_credential(
 
     let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
         parse_upstream_url(&upstream_url)?;
-    if let Err(reason) = validate_http_upstream_target(upstream_scheme, &upstream_host) {
-        warn!("{}", reason);
-        send_error(stream, 502, "Bad Gateway").await?;
+    // DNS resolve + host check via the filter
+    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        warn!("Upstream host denied by filter: {}", reason);
+        send_error(stream, 403, "Forbidden").await?;
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
@@ -375,13 +380,11 @@ async fn handle_oauth2_credential(
         );
         return Ok(());
     }
-
-    // DNS resolve + host check via the filter
-    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
-    if !check.result.is_allowed() {
-        let reason = check.result.reason();
-        warn!("Upstream host denied by filter: {}", reason);
-        send_error(stream, 403, "Forbidden").await?;
+    if let Err(reason) =
+        validate_http_upstream_target(upstream_scheme, &upstream_host, &check.resolved_addrs)
+    {
+        warn!("{}", reason);
+        send_error(stream, 502, "Bad Gateway").await?;
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::Reverse,
@@ -692,12 +695,16 @@ enum UpstreamScheme {
     Https,
 }
 
-fn validate_http_upstream_target(scheme: UpstreamScheme, host: &str) -> std::result::Result<(), String> {
+fn validate_http_upstream_target(
+    scheme: UpstreamScheme,
+    host: &str,
+    resolved_addrs: &[SocketAddr],
+) -> std::result::Result<(), String> {
     if matches!(scheme, UpstreamScheme::Https) {
         return Ok(());
     }
 
-    if is_local_only_host(host) {
+    if is_local_only_target(host, resolved_addrs) {
         Ok(())
     } else {
         Err(format!(
@@ -707,9 +714,12 @@ fn validate_http_upstream_target(scheme: UpstreamScheme, host: &str) -> std::res
     }
 }
 
-fn is_local_only_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+fn is_local_only_target(host: &str, resolved_addrs: &[SocketAddr]) -> bool {
+    if !resolved_addrs.is_empty() {
+        return resolved_addrs.iter().all(|addr| {
+            let ip = addr.ip();
+            ip.is_loopback() || ip.is_unspecified()
+        });
     }
 
     match host.parse::<std::net::IpAddr>() {
@@ -1483,16 +1493,25 @@ mod tests {
 
     #[test]
     fn test_validate_http_upstream_target_rejects_non_local_host() {
-        let err = validate_http_upstream_target(UpstreamScheme::Http, "api.example.com")
+        let err = validate_http_upstream_target(UpstreamScheme::Http, "api.example.com", &[])
             .expect_err("non-local http upstream should be rejected");
         assert!(err.contains("refusing insecure http upstream"));
     }
 
     #[test]
     fn test_validate_http_upstream_target_allows_loopback() {
-        assert!(validate_http_upstream_target(UpstreamScheme::Http, "127.0.0.1").is_ok());
-        assert!(validate_http_upstream_target(UpstreamScheme::Http, "::1").is_ok());
-        assert!(validate_http_upstream_target(UpstreamScheme::Http, "localhost").is_ok());
+        let loopback = [SocketAddr::from(([127, 0, 0, 1], 8080))];
+        assert!(validate_http_upstream_target(UpstreamScheme::Http, "127.0.0.1", &[]).is_ok());
+        assert!(validate_http_upstream_target(UpstreamScheme::Http, "::1", &[]).is_ok());
+        assert!(validate_http_upstream_target(UpstreamScheme::Http, "localhost", &loopback).is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_upstream_target_rejects_localhost_resolving_non_loopback() {
+        let poisoned = [SocketAddr::from(([203, 0, 113, 10], 8080))];
+        let err = validate_http_upstream_target(UpstreamScheme::Http, "localhost", &poisoned)
+            .expect_err("localhost resolving off-host should be rejected");
+        assert!(err.contains("refusing insecure http upstream"));
     }
 
     #[test]
