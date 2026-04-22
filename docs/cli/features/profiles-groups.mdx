@@ -62,7 +62,11 @@ Profiles use JSON format:
     "write": [],
     "allow_file": [],
     "read_file": [],
-    "write_file": []
+    "write_file": [],
+    "unix_socket": [],
+    "unix_socket_bind": [],
+    "unix_socket_dir": [],
+    "unix_socket_dir_bind": []
   },
   "policy": {
     "exclude_groups": [],
@@ -78,6 +82,29 @@ Profiles use JSON format:
   }
 }
 ```
+
+### AF_UNIX Socket Grants
+
+The `unix_socket*` filesystem fields grant `connect(2)` (and optionally
+`bind(2)`) on pathname AF_UNIX sockets. Abstract-namespace and unnamed
+sockets are never grantable — only filesystem-backed socket paths.
+
+| Field | Grants | Implied fs grant |
+|---|---|---|
+| `unix_socket` | `connect` only, single socket file | Read on the file |
+| `unix_socket_bind` | `connect` + `bind`, single socket file | ReadWrite on the file (exists) or on the parent directory (pending — bind will create the file) |
+| `unix_socket_dir` | `connect` only, any direct child of a directory | Read on the directory (recursive) |
+| `unix_socket_dir_bind` | `connect` + `bind`, any direct child of a directory | ReadWrite on the directory (recursive) |
+
+Directory forms are **non-recursive at the socket layer**: only sockets
+directly inside the named directory are covered, not those in
+subdirectories. The implied filesystem grant is recursive (Landlock's
+only expressible granularity), so the non-recursion is enforced
+separately by the supervisor (Linux) or Seatbelt regex emission (macOS).
+
+Under restricted network modes (`--block-net` or `--network-profile`),
+`connect(2)` to a Unix socket requires an explicit `unix_socket*` grant
+— a plain `allow_file`/`allow` grant no longer implicitly permits it.
 
 ### Working Directory
 
