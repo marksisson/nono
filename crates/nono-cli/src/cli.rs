@@ -1340,6 +1340,16 @@ pub struct RunArgs {
     #[arg(long, help_heading = "OPTIONS")]
     pub audit_integrity: bool,
 
+    /// Sign the audit Merkle root with a keyed signing key loaded from the given secret reference.
+    /// Accepts bare trust-key IDs, keystore:// names, file:// paths, op:// URIs, apple-password:// URIs, keyring:// URIs, or env:// URIs.
+    #[arg(
+        long,
+        value_name = "SECRET_REF",
+        conflicts_with_all = ["no_audit", "no_audit_integrity"],
+        help_heading = "OPTIONS"
+    )]
+    pub audit_sign_key: Option<String>,
+
     /// Disable trust verification (not recommended for production)
     #[arg(long, help_heading = "OPTIONS")]
     pub trust_override: bool,
@@ -1756,6 +1766,10 @@ pub struct AuditShowArgs {
 pub struct AuditVerifyArgs {
     /// Session ID (e.g., 20260214-143022-12345)
     pub session_id: String,
+
+    /// Public key file to match against the attested signer key (PEM or base64 DER)
+    #[arg(long, value_name = "FILE")]
+    pub public_key_file: Option<PathBuf>,
 
     /// Output as JSON
     #[arg(long)]

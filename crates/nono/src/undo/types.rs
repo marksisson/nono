@@ -227,6 +227,19 @@ pub struct AuditIntegritySummary {
     pub merkle_root: ContentHash,
 }
 
+/// Signed attestation metadata for an audit session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditAttestationSummary {
+    /// Predicate type embedded in the DSSE/in-toto statement.
+    pub predicate_type: String,
+    /// Signer key identifier derived from the public key.
+    pub key_id: String,
+    /// DER-encoded public key as base64, used for standalone keyed verification.
+    pub public_key: String,
+    /// Filename of the bundle written into the session directory.
+    pub bundle_filename: String,
+}
+
 /// Identity of the executable binary launched for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutableIdentity {
@@ -267,6 +280,9 @@ pub struct SessionMetadata {
     /// Optional integrity summary for the append-only audit log
     #[serde(default)]
     pub audit_integrity: Option<AuditIntegritySummary>,
+    /// Optional keyed signature over the audit Merkle root and session context
+    #[serde(default)]
+    pub audit_attestation: Option<AuditAttestationSummary>,
 }
 
 /// A snapshot manifest capturing filesystem state at a point in time

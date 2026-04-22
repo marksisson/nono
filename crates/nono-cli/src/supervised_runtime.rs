@@ -1,3 +1,4 @@
+use crate::audit_attestation::AuditSigner;
 use crate::audit_integrity::AuditRecorder;
 use crate::launch_runtime::{
     ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
@@ -32,6 +33,7 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) proxy: &'a ProxyLaunchOptions,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
+    pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) silent: bool,
 }
 
@@ -142,6 +144,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         proxy,
         proxy_handle,
         executable_identity,
+        audit_signer,
         silent,
     } = ctx;
 
@@ -248,6 +251,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
         executable_identity,
+        audit_signer,
         started: &started,
         ended: &ended,
         command,

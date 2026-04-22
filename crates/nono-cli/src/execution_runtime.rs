@@ -1,3 +1,4 @@
+use crate::audit_attestation::prepare_audit_signer;
 use crate::launch_runtime::{select_threading_context, LaunchPlan};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{execute_supervised_runtime, SupervisedRuntimeContext};
@@ -214,6 +215,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         None
     };
+    let audit_signer = prepare_audit_signer(rollback.audit_sign_key.as_deref())?;
+    if audit_signer.is_some() && !matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
+        return Err(NonoError::ConfigParse(
+            "--audit-sign-key requires supervised execution".to_string(),
+        ));
+    }
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
     let mut env_vars: Vec<(&str, &str)> = loaded_secrets
@@ -318,6 +325,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 proxy,
                 proxy_handle: proxy_handle.as_ref(),
                 executable_identity: executable_identity.as_ref(),
+                audit_signer: audit_signer.as_ref(),
                 silent: flags.silent,
             })?;
 

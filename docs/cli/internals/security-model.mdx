@@ -21,7 +21,7 @@ There are three trust domains:
 
 The supervisor is trusted but constrained. It can only grant access to files it can open itself (standard Unix permissions apply), and protected nono state roots are checked before any approval backend is consulted.
 
-In supervised mode, audit recording also lives in this trust boundary. The sandboxed child does not write its own audit log. Instead, the trusted parent records session metadata, supervisor-observed events, session-local integrity data, and the global audit ledger entry for that session.
+In supervised mode, audit recording also lives in this trust boundary. The sandboxed child does not write its own audit log. Instead, the trusted parent records session metadata, supervisor-observed events, session-local integrity data, the global audit ledger entry for that session, and any optional audit attestation signature.
 
 When proxy mode is active, a fourth domain exists:
 
@@ -261,15 +261,18 @@ The audit subsystem has a narrower security claim than the sandbox itself.
 - Session-local hashes are not, by themselves, sufficient history integrity. nono therefore records audited sessions into a global audit ledger as sessions complete.
 - The current ledger is still local host state. Without a future signature or external anchor, a host attacker who can rewrite both the session files and the ledger can forge a self-consistent history.
 - For supervised sessions, the supervisor hashes the resolved main executable binary and binds that `{ resolved_path, sha256 }` identity into session metadata and the global audit ledger.
+- When `--audit-sign-key` is configured, the supervisor also signs the session's audit Merkle root and session context using a keyed DSSE/in-toto attestation. The signature is written into the session directory and can later be checked with the corresponding public key.
 - That executable identity is not full runtime provenance. Shared libraries, interpreter chains, scripts passed as arguments, and dynamically loaded runtime dependencies are not covered by that binary hash.
 - The executable hash is computed before `exec`, not from the final kernel-loaded file descriptor. A privileged attacker with write access to the executable path could still race between hash and execution.
+- The keyed audit attestation is only as strong as the signing key distribution model. If the verifier does not pin the expected public key, a rewritten session could also rewrite the embedded public key and remain self-consistent.
+- `nono audit verify --public-key-file <FILE>` is the path that pins verification to an expected signer key. Without that, attestation verification checks the keyed signature against the public key recorded in session metadata.
 - Filesystem Merkle roots under `--audit-integrity` or `--rollback` commit tracked writable paths, not the full machine state.
 
 The correct way to read the feature today is:
 
 - sandbox enforcement: kernel-enforced and fail-closed
 - audit trail: supervisor-recorded and tamper-evident within the local integrity model
-- attestation: not complete until an external signature or anchor is added
+- attestation: keyed signing is available for session audit roots, but external anchoring and timestamping are still future work
 
 ## What If the Supervisor Is Compromised?
 

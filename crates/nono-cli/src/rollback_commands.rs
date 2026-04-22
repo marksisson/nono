@@ -1339,6 +1339,7 @@ mod tests {
             network_events: vec![],
             audit_event_count: 0,
             audit_integrity: None,
+            audit_attestation: None,
         };
 
         let session = SessionInfo {
@@ -1373,6 +1374,7 @@ mod tests {
             network_events: vec![],
             audit_event_count: 0,
             audit_integrity: None,
+            audit_attestation: None,
         };
         let meta2 = SessionMetadata {
             session_id: "20260219-110000-67890".to_string(),
@@ -1387,6 +1389,7 @@ mod tests {
             network_events: vec![],
             audit_event_count: 0,
             audit_integrity: None,
+            audit_attestation: None,
         };
 
         let s1 = SessionInfo {
@@ -1432,6 +1435,7 @@ mod tests {
             network_events: vec![],
             audit_event_count: 0,
             audit_integrity: None,
+            audit_attestation: None,
         };
 
         let session = SessionInfo {

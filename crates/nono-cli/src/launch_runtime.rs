@@ -52,6 +52,7 @@ pub(crate) struct RollbackLaunchOptions {
     pub(crate) audit_disabled: bool,
     pub(crate) no_audit_integrity: bool,
     pub(crate) audit_integrity: bool,
+    pub(crate) audit_sign_key: Option<String>,
     pub(crate) destination: Option<PathBuf>,
     pub(crate) track_all: bool,
     pub(crate) skip_dirs: Vec<String>,
@@ -140,7 +141,18 @@ pub(crate) fn prepare_run_launch_plan(
     let no_rollback_prompt = run_args.no_rollback_prompt;
     let no_audit = run_args.no_audit;
     let no_audit_integrity = run_args.no_audit_integrity;
+    let audit_sign_key = run_args.audit_sign_key.clone();
     let trust_override = run_args.trust_override;
+
+    if audit_sign_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && (no_audit || no_audit_integrity)
+    {
+        return Err(NonoError::ConfigParse(
+            "--audit-sign-key requires audit integrity to be enabled".to_string(),
+        ));
+    }
 
     let mut prepared = prepare_sandbox(&args, silent)?;
     validate_rollback_destination(run_args.rollback_dest.as_ref(), &prepared)?;
@@ -232,6 +244,7 @@ pub(crate) fn prepare_run_launch_plan(
                 audit_disabled: no_audit,
                 no_audit_integrity,
                 audit_integrity: run_args.audit_integrity,
+                audit_sign_key,
                 destination: run_args.rollback_dest,
                 ..rollback_options
             },

@@ -2,6 +2,7 @@
 //!
 //! Handles `nono audit list|show` for viewing the audit trail of sandboxed sessions.
 
+use crate::audit_attestation::verify_audit_attestation;
 use crate::audit_integrity::verify_audit_log;
 use crate::audit_ledger::verify_session_in_ledger;
 use crate::audit_session::{
@@ -294,6 +295,9 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
         );
         eprintln!("  Chain:    {}", &integrity.chain_head.to_string()[..16]);
         eprintln!("  Root:     {}", &integrity.merkle_root.to_string()[..16]);
+        if let Some(ref attestation) = session.metadata.audit_attestation {
+            eprintln!("  Signed:   {}", attestation.key_id);
+        }
     } else if session.metadata.audit_event_count > 0 {
         eprintln!("  Audit:    {} events", session.metadata.audit_event_count);
     }
@@ -382,22 +386,35 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
     let session = load_session(&args.session_id)?;
     let result = verify_audit_log(&session.dir, session.metadata.audit_integrity.as_ref())?;
     let ledger = verify_session_in_ledger(&session.metadata)?;
+    let attestation = verify_audit_attestation(
+        &session.dir,
+        &session.metadata,
+        args.public_key_file.as_deref(),
+    )?;
 
     if args.json {
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "session": result,
             "ledger": ledger,
+            "attestation": attestation,
         }))
         .map_err(|e| NonoError::Snapshot(format!("JSON serialization failed: {e}")))?;
         println!("{json}");
         return Ok(());
     }
 
+    let attestation_verified = (!attestation.present && attestation.verification_error.is_none())
+        || (attestation.signature_verified
+            && attestation.key_id_matches
+            && attestation.merkle_root_matches
+            && attestation.session_id_matches
+            && attestation.expected_public_key_matches.unwrap_or(true));
     let verified = result.records_verified
         && result.event_count_matches
         && ledger.session_found
         && ledger.session_digest_matches
-        && ledger.ledger_chain_verified;
+        && ledger.ledger_chain_verified
+        && attestation_verified;
     let status = if verified {
         "VERIFIED".green().bold()
     } else {
@@ -457,6 +474,41 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
             .map(|h| h.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+    if attestation.present {
+        let signed_status = if attestation_verified {
+            if attestation.expected_public_key_matches.is_some() {
+                "verified".green().bold().to_string()
+            } else {
+                "self-attested".yellow().bold().to_string()
+            }
+        } else {
+            "mismatch".red().bold().to_string()
+        };
+        eprintln!(
+            "  Signed:   {} (key={})",
+            signed_status,
+            attestation
+                .key_id
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        );
+        if let Some(matches) = attestation.expected_public_key_matches {
+            eprintln!(
+                "  Pubkey:   {}",
+                if matches {
+                    "matched".green().bold().to_string()
+                } else {
+                    "mismatch".red().bold().to_string()
+                }
+            );
+        }
+        if attestation.expected_public_key_matches.is_none() && attestation_verified {
+            eprintln!("  Trust:    rely on ledger chain, or pass --public-key-file to pin signer");
+        }
+        if let Some(ref error) = attestation.verification_error {
+            eprintln!("  Attest:   {}", sanitize_for_terminal(error));
+        }
+    }
 
     if verified {
         Ok(())
@@ -727,6 +779,7 @@ mod list_tests {
             network_events: vec![],
             audit_event_count: 4,
             audit_integrity: None,
+            audit_attestation: None,
         };
 
         let session = SessionInfo {

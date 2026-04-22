@@ -18,6 +18,7 @@ Each session records:
 - **Merkle roots**: Filesystem-state commitments (when `--audit-integrity` or `--rollback` is active)
 - **Snapshots**: Content-addressable rollback metadata (when `--rollback` is active)
 - **Audit integrity summary**: Hash-chain head and Merkle root for the audit event stream unless disabled with `--no-audit-integrity`
+- **Audit attestation**: Optional keyed DSSE signature over the session's audit Merkle root and session context when `--audit-sign-key` is used
 
 Audit is enabled by default for all supervised executions (`nono run`, `nono shell`). The Merkleized audit event log is also enabled by default.
 
@@ -46,6 +47,18 @@ Every audited session writes an append-only `audit-events.ndjson` file for the s
 - a Merkle root over all recorded event leaves
 
 With `--audit-integrity`, nono also walks the tracked writable roots and records pre/post filesystem Merkle roots. `--rollback` goes further by storing content-addressable snapshots that can be restored later.
+
+To have the supervisor sign the audit Merkle root, use `--audit-sign-key`:
+
+```bash
+# Sign with a trust key from the default keystore
+nono run --audit-sign-key default --allow-cwd -- my-agent
+
+# Sign with an explicit secret backend reference
+nono run --audit-sign-key op://Development/Nono/audit-key --profile claude-code -- claude
+```
+
+The signing key is loaded by the trusted supervisor before sandbox activation. The resulting keyed DSSE bundle is written into the session directory as `audit-attestation.bundle`, and a summary is stored in `session.json`.
 
 ## Commands
 
@@ -114,6 +127,35 @@ nono audit show 20260214-143022-12345 --json
 
 The JSON output includes all recorded session metadata, optional filesystem integrity data, optional rollback snapshot data, and exit status. This format is suitable for ingestion by compliance tools or log aggregators.
 
+If the session was signed with `--audit-sign-key`, `nono audit show` also includes:
+
+- the attestation predicate type
+- the signer key id
+- the attested public key
+- the attestation bundle filename
+
+### `nono audit verify`
+
+Verify the recorded audit log, its inclusion in the local audit ledger, and any optional audit attestation.
+
+```bash
+# Verify session-local audit integrity and ledger inclusion
+nono audit verify 20260214-143022-12345
+
+# Also pin the attestation to a specific public key
+nono audit verify 20260214-143022-12345 --public-key-file ./audit-signing-key.pub
+
+# Machine-readable output
+nono audit verify 20260214-143022-12345 --json
+```
+
+When an attestation is present, verification checks:
+
+- the keyed DSSE signature
+- the attested Merkle root against the session's stored audit integrity summary
+- the session id bound into the attestation predicate
+- the provided public key, if `--public-key-file` is supplied
+
 ## Use Cases
 
 ### Debugging
@@ -158,7 +200,7 @@ Audit, audit integrity, and rollback are separate layers that share the same ses
 | Default | Always on | Event-log integrity on by default; filesystem hashing opt-in via `--audit-integrity` | Opt-in (`--rollback`) |
 | Opt-out | `--no-audit` | `--no-audit-integrity` disables event-log integrity | `--no-rollback` |
 | Purpose | Record what happened | Detect tampering in the recorded audit log and optionally commit filesystem state | Restore filesystem state |
-| Data | Command, timestamps, exit code, audit events, network events, tracked paths | Event count, chain head, Merkle root, optional filesystem Merkle roots | Full file content snapshots + Merkle roots |
+| Data | Command, timestamps, exit code, audit events, network events, tracked paths, optional audit attestation | Event count, chain head, Merkle root, optional filesystem Merkle roots | Full file content snapshots + Merkle roots |
 | Commands | `nono audit list/show/verify/cleanup` | `nono audit show/verify` | `nono rollback list/show/restore/verify/cleanup` |
 
 When rollback is active, it enriches the audit record with snapshots and restore metadata. When filesystem audit integrity is active, `nono audit show` also includes tracked paths and filesystem Merkle roots.
@@ -169,7 +211,8 @@ The audit trail is intentionally narrow in what it claims to prove.
 
 - The event log is recorded by the trusted supervisor, not by the sandboxed child.
 - The default integrity structure protects the audit event stream for a single session and also records that session into the global audit ledger.
-- Without a future external signature or anchor, this is still host-local tamper evidence, not third-party attestation.
+- `--audit-sign-key` adds a keyed supervisor-side signature over the session audit Merkle root and session context, but that still depends on trusting the configured signing key and how its public key is distributed.
+- Without an external timestamp, transparency log, or other anchor, this remains host-local attestation material rather than a globally witnessed timestamped proof.
 - For supervised runs, the supervisor hashes the main executable binary selected for launch and records its canonical path and SHA-256 digest.
 - That executable hash is still subject to a small hash-to-exec race window. nono hashes the file before `exec`, but does not yet `fexecve` from the same already-open file descriptor.
 - Only the main executable (`argv[0]` after resolution) is hashed. For `bash script.sh`, this commits `/bin/bash`, not `script.sh`, shared libraries, interpreters in a launch chain, or dynamically loaded plugins/modules.
@@ -177,7 +220,8 @@ The audit trail is intentionally narrow in what it claims to prove.
 - `--audit-integrity` records filesystem-state Merkle roots over tracked writable paths, but it does not capture rollback objects or restore data. Use `--rollback` for that.
 - Filesystem-state hashing does not attest the full runtime closure of a process. Shared libraries, interpreters, dynamically loaded plugins, and other runtime dependencies are not committed unless separately recorded.
 - `network_events` and rollback metadata are separate recorded structures. They are not a claim of full system provenance or full host compromise detection.
+- `--audit-sign-key` signs the main session audit Merkle root, not every possible host-side artifact. It does not sign shared libraries, runtime module loads, or an external timestamp by itself.
 
 ## Storage
 
-Audit sessions are stored in `~/.nono/audit/`. Audit-only sessions are small (`session.json` and `audit-events.ndjson`). Clean them up with `nono audit cleanup`.
+Audit sessions are stored in `~/.nono/audit/`. Audit-only sessions are small (`session.json` and `audit-events.ndjson`). Signed sessions also include `audit-attestation.bundle`. Clean them up with `nono audit cleanup`.

@@ -1,6 +1,8 @@
 use crate::audit_session::audit_root;
 use nix::fcntl::{Flock, FlockArg};
-use nono::undo::{AuditIntegritySummary, ContentHash, NetworkAuditEvent, SessionMetadata};
+use nono::undo::{
+    AuditAttestationSummary, AuditIntegritySummary, ContentHash, NetworkAuditEvent, SessionMetadata,
+};
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +32,7 @@ struct SessionDigestPayload<'a> {
     network_events: &'a [NetworkAuditEvent],
     audit_event_count: u64,
     audit_integrity: &'a Option<AuditIntegritySummary>,
+    audit_attestation: &'a Option<AuditAttestationSummary>,
 }
 
 #[derive(Serialize)]
@@ -90,6 +93,7 @@ pub(crate) fn compute_session_digest(metadata: &SessionMetadata) -> Result<Conte
         network_events: &metadata.network_events,
         audit_event_count: metadata.audit_event_count,
         audit_integrity: &metadata.audit_integrity,
+        audit_attestation: &metadata.audit_attestation,
     };
     let bytes = serde_json::to_vec(&payload).map_err(|e| {
         NonoError::Snapshot(format!("Failed to serialize session digest payload: {e}"))
@@ -350,7 +354,9 @@ fn hash_ledger_link(
 mod tests {
     use super::*;
     use crate::test_env::{EnvVarGuard, ENV_LOCK};
-    use nono::undo::{ExecutableIdentity, NetworkAuditDecision, NetworkAuditMode};
+    use nono::undo::{
+        AuditAttestationSummary, ExecutableIdentity, NetworkAuditDecision, NetworkAuditMode,
+    };
     #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
@@ -370,6 +376,7 @@ mod tests {
             network_events: Vec::new(),
             audit_event_count: 2,
             audit_integrity: None,
+            audit_attestation: None,
         }
     }
 
@@ -423,6 +430,7 @@ mod tests {
                 chain_head: ContentHash::from_bytes([2; 32]),
                 merkle_root: ContentHash::from_bytes([3; 32]),
             }),
+            audit_attestation: None,
         };
         let base_digest = compute_session_digest(&base).unwrap();
 
@@ -463,6 +471,15 @@ mod tests {
 
         let mut changed = base.clone();
         changed.merkle_roots.push(ContentHash::from_bytes([4; 32]));
+        assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
+
+        let mut changed = base.clone();
+        changed.audit_attestation = Some(AuditAttestationSummary {
+            predicate_type: "https://nono.sh/attestation/audit-session/alpha".to_string(),
+            key_id: "test-key".to_string(),
+            public_key: "Zm9v".to_string(),
+            bundle_filename: "audit-attestation.bundle".to_string(),
+        });
         assert_ne!(base_digest, compute_session_digest(&changed).unwrap());
 
         let mut changed = base.clone();

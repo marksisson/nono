@@ -723,7 +723,7 @@ nono run --no-rollback --allow . -- npm test
 
 #### `--no-audit`
 
-Disable the audit trail for this session. By default, every supervised execution records session metadata and audit events (command, timestamps, exit code, capability decisions, URL opens, network events) to `~/.nono/rollbacks/`. Use this flag to suppress audit recording entirely.
+Disable the audit trail for this session. By default, every supervised execution records session metadata and audit events (command, timestamps, exit code, capability decisions, URL opens, network events) to `~/.nono/audit/`. Use this flag to suppress audit recording entirely.
 
 ```bash
 nono run --no-audit --allow-cwd -- my-command
@@ -747,6 +747,40 @@ nono run --audit-integrity --rollback --profile claude-code -- claude
 
 <Note>
   `--audit-integrity` protects the audit log that nono records. It does not replace `--rollback`, which is still the feature that captures filesystem state and restoreable snapshots.
+</Note>
+
+#### `--audit-sign-key`
+
+Sign the session's audit Merkle root with a keyed signing key loaded by the supervisor. The resulting keyed DSSE attestation is written to `audit-attestation.bundle` in the audit session directory, and a summary is recorded in `session.json`.
+
+Accepted secret references:
+- bare trust key IDs, for example `default`
+- `keystore://name`
+- `file:///absolute/path`
+- `op://vault/item/field`
+- `apple-password://server/account`
+- `keyring://service/account`
+- `env://VAR_NAME`
+
+```bash
+# Sign with the default trust key from the keystore
+nono run --audit-sign-key default --allow-cwd -- my-agent
+
+# Sign with an explicit file-backed key
+nono run --audit-sign-key file:///tmp/nono-audit-key.pem --allow-cwd -- my-agent
+
+# Sign with a 1Password-backed key
+nono run --audit-sign-key op://Development/Nono/audit-key --profile claude-code -- claude
+```
+
+The corresponding attestation can be pinned during verification:
+
+```bash
+nono audit verify <session-id> --public-key-file ./audit-signing-key.pub
+```
+
+<Note>
+  `--audit-sign-key` signs the session audit Merkle root and session context. It does not, by itself, add an external timestamp, Rekor entry, or full runtime-closure attestation.
 </Note>
 
 #### `--rollback-exclude`
