@@ -1089,10 +1089,17 @@ fn select_attach_replay_bytes(
             replay.extend_from_slice(&rendered_snapshot);
             replay
         }
+    } else if raw_scrollback.is_empty() {
+        rendered_snapshot
     } else if rendered_snapshot.is_empty() || rendered_plaintext.trim().is_empty() {
         raw_scrollback
     } else {
-        rendered_snapshot
+        // Emit the full raw history first so the reattaching terminal's native
+        // scrollback receives every byte the child has produced (up to the 8 MB
+        // rolling window), then repaint the visible screen cleanly.
+        let mut replay = raw_scrollback;
+        replay.extend_from_slice(&rendered_snapshot);
+        replay
     }
 }
 
@@ -2097,14 +2104,36 @@ mod tests {
     }
 
     #[test]
-    fn attach_replay_uses_rendered_snapshot_for_normal_screen() {
+    fn attach_replay_prepends_raw_history_for_normal_screen() {
         let replay = select_attach_replay_bytes(
             false,
             b"raw".to_vec(),
             b"rendered".to_vec(),
             "visible text".to_string(),
         );
+        assert_eq!(replay, b"rawrendered");
+    }
+
+    #[test]
+    fn attach_replay_uses_rendered_snapshot_when_normal_screen_has_no_history() {
+        let replay = select_attach_replay_bytes(
+            false,
+            Vec::new(),
+            b"rendered".to_vec(),
+            "visible text".to_string(),
+        );
         assert_eq!(replay, b"rendered");
+    }
+
+    #[test]
+    fn attach_replay_falls_back_to_raw_if_normal_plaintext_is_blank() {
+        let replay = select_attach_replay_bytes(
+            false,
+            b"raw".to_vec(),
+            b"rendered".to_vec(),
+            "   ".to_string(),
+        );
+        assert_eq!(replay, b"raw");
     }
 
     #[test]
