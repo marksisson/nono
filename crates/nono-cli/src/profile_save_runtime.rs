@@ -865,9 +865,9 @@ mod tests {
             ),
         ]);
 
-        // `claude-code` is a known built-in; writing to that user path would
+        // `codex` is a known built-in; writing to that user path would
         // shadow it.
-        assert!(would_shadow_builtin("claude-code"));
+        assert!(would_shadow_builtin("opencode"));
         // Names that don't exist as built-ins are fine.
         assert!(!would_shadow_builtin("my-unique-saved-profile"));
     }
@@ -887,15 +887,15 @@ mod tests {
 
         // Pre-create a user override of a built-in. A subsequent save to the
         // same name is an update, not a new shadow, and must be allowed.
-        let path = profile::get_user_profile_path("claude-code").expect("profile path");
+        let path = profile::get_user_profile_path("opencode").expect("profile path");
         std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
         std::fs::write(
             &path,
-            "{\"meta\":{\"name\":\"claude-code\",\"version\":\"1.0.0\"}}\n",
+            "{\"meta\":{\"name\":\"codex\",\"version\":\"1.0.0\"}}\n",
         )
         .expect("write");
 
-        assert!(!would_shadow_builtin("claude-code"));
+        assert!(!would_shadow_builtin("opencode"));
     }
 
     #[test]

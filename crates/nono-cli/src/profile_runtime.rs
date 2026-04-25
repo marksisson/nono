@@ -1,5 +1,5 @@
 use crate::cli::SandboxArgs;
-use crate::{hooks, package, profile};
+use crate::{package, profile};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,38 +34,21 @@ struct PrepareProfileOptions {
     hook_output_silent: bool,
 }
 
-fn install_profile_hooks(profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
+fn install_profile_hooks(_profile_name: Option<&str>, profile: &profile::Profile, silent: bool) {
+    // In-binary hook installation was removed in v0.44.0 alongside
+    // the hooks.rs module. Profiles that ship a `hooks.<target>`
+    // block are surfaced as a one-line note; the actual wiring
+    // belongs in the pack's `wiring` directives now.
     if profile.hooks.hooks.is_empty() {
         return;
     }
-
-    match hooks::install_profile_hooks(profile_name, &profile.hooks.hooks) {
-        Ok(results) => {
-            for (target, result) in results {
-                match result {
-                    hooks::HookInstallResult::Installed => {
-                        if !silent {
-                            eprintln!(
-                                "  Installing {} hook to ~/.claude/hooks/nono-hook.sh",
-                                target
-                            );
-                        }
-                    }
-                    hooks::HookInstallResult::Updated => {
-                        if !silent {
-                            eprintln!("  Updating {} hook (new version available)", target);
-                        }
-                    }
-                    hooks::HookInstallResult::AlreadyInstalled
-                    | hooks::HookInstallResult::Skipped => {}
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to install profile hooks: {}", e);
-            if !silent {
-                eprintln!("  Warning: Failed to install hooks: {}", e);
-            }
+    if !silent {
+        for target in profile.hooks.hooks.keys() {
+            eprintln!(
+                "  Note: profile declares hooks.{target} but in-profile hook \
+                 installation has been removed; move the wiring into the pack's \
+                 package.json `wiring` directives."
+            );
         }
     }
 }
@@ -284,6 +267,9 @@ fn prepare_profile_with_options(
     options: PrepareProfileOptions,
 ) -> crate::Result<PreparedProfile> {
     let loaded_profile = if let Some(ref profile_name) = args.profile {
+        // The claude-code → registry-pack migration is wired into
+        // `load_profile` itself so it fires from every call site (run,
+        // wrap, shell, profile show, why, learn) without duplication.
         let profile = profile::load_profile(profile_name)?;
         verify_profile_packs(&profile.packs)?;
 
