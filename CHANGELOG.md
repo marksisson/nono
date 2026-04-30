@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.45.0] - 2026-04-30
+
+### Features
+
+- *(packages)* Use native tls root certificates
+
 ## [0.44.0] - 2026-04-29
 
 ### Bug Fixes
