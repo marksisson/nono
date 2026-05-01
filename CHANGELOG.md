@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.46.0] - 2026-05-01
+
+### Bug Fixes
+
+- *(policy)* Add XDG_STATE_HOME nix profiles path to nix_runtime group
+
+- *(policy)* Make nix_runtime group cross-platform
+
+- *(cli)* Re-validate deny overlaps after all grants
+
+- Update examples in setup.rs
+
+
+### Features
+
+- *(network)* Support GitLab developer domains
+
+
+### Testing
+
+- *(cli-tests)* Add workdir access to deny overlap test
+
+- Exclude system_write_linux in post-CWD overlap regression test
+
 ## [0.45.0] - 2026-04-30
 
 ### Features
